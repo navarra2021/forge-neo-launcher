@@ -1,0 +1,48 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>ForgeNeoLauncher</AssemblyName>
+    <RootNamespace>ForgeNeoLauncher</RootNamespace>
+    <!-- 单文件发布 + 自包含（连 .NET 运行时一起打进 exe），
+         对方机器不用装 .NET 8 桌面运行时也能双击就跑 -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <!-- 单文件内部压缩：不压约 150 MB，压完约 70 MB。
+         代价是首次启动要把原生库解到 %TEMP%\.net\ 下（之后复用缓存）。
+         WPF 不支持裁剪（PublishTrimmed 会破坏 XAML 反射），所以只能靠压缩省体积。 -->
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <!-- 程序图标（写入 exe，任务栏/窗口/快捷方式都会用它）-->
+    <ApplicationIcon>icon\face_adaptive.ico</ApplicationIcon>
+    <!-- 版本信息（会写入 exe 文件属性）-->
+    <!-- 0.x 阶段采用线性递进编号：0.1 → 0.9 → 0.10 → 0.100，此处两段式写法 -->
+    <Version>0.26</Version>
+    <AssemblyVersion>0.26.0.0</AssemblyVersion>
+    <FileVersion>0.26.0.0</FileVersion>
+    <InformationalVersion>0.26</InformationalVersion>
+    <Product>Forge Neo 启动器</Product>
+    <AssemblyTitle>Forge Neo 启动器</AssemblyTitle>
+    <Description>Forge Neo 图形化启动器 —— 一键启动、实时日志、主题切换、版本管理、高级选项、PyTorch 环境、便携部署</Description>
+    <Company>Forge Neo Launcher</Company>
+    <!-- 署名：写进 exe 文件属性「版权」项（右键 - 属性 - 详细信息），需重新编译才生效。
+         注意 Authors 是 NuGet 打包字段、不写进 exe，署名别用它。 -->
+    <Copyright>Copyright (c) 2026 NavarraCN</Copyright>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 同时作为 WPF 资源，供 Window.Icon 使用（任务栏/Alt-Tab 更清晰）-->
+    <Resource Include="icon\face_adaptive.ico" />
+    <!-- 侧边栏 logo（圆角已烘入 PNG 的 alpha 通道）-->
+    <Resource Include="icon\logo_face.png" />
+    <!-- 首页横幅 -->
+    <Resource Include="Assets\home-banner.jpg" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,20 @@
+# ---- 构建产物 ----
+bin/
+obj/
+_published/
+.vs/
+*.user
+*.suo
+
+# ---- 二进制 / 发布物（走 Releases，不进仓库）----
+*.exe
+*.dll
+*.pdb
+
+# ---- 本机运行时配置（含个人路径、端口等设置）----
+launcher.cfg
+
+# ---- 系统杂物 ----
+Thumbs.db
+desktop.ini
+.DS_Store
