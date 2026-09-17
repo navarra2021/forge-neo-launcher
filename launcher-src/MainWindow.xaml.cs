@@ -133,6 +133,15 @@ namespace ForgeNeoLauncher
             // uv 的其余隔离项 + 下载源
             DeployManager.ApplyUvEnv(psi);
             DeployManager.ApplySourceEnv(psi, advOpts.MirrorSource);
+
+            // 让「装依赖在干什么」看得见（抵消扩展 install.py 里写死的 pip -q + 全量日志落文件）
+            DeployManager.ApplyDependencyVisibilityEnv(psi);
+
+            // 钉版约束（兜底）：把 Forge requirements.txt 里钉死的版本交给 pip / uv，
+            // 使扩展的 install.py 顶不掉它们 —— 否则像 wd14-tagger 的裸 `tensorflow`
+            // 会把 protobuf 顶到 7.x，Forge 就永久起不来了。
+            // 详见 AdvancedOptions.InstallExtDeps 的「踩过的坑（二）」。
+            DeployManager.ApplyConstraintEnv(psi);
         }
 
         // ---- 状态 ----
@@ -527,6 +536,9 @@ namespace ForgeNeoLauncher
             }
 
             AddLog($"正在启动 Forge Neo ...", InfoBrush);
+            // 装依赖那段最容易被误判成「卡死」（扩展的 install.py 原本带 -q，全程静默）。
+            // 这里先把「去哪儿看」说清楚：实时看本窗口，事后翻这个文件。
+            AddLog($"依赖安装的完整日志会写在：{AppPaths.PipLogFile}", InfoBrush);
             try
             {
                 var psi = new ProcessStartInfo
@@ -2161,17 +2173,48 @@ namespace ForgeNeoLauncher
         private static readonly System.Text.RegularExpressions.Regex RxResolved =
             new System.Text.RegularExpressions.Regex(@"^\s*Resolved\s+(\d+)\s+packages?",
                 System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        /// <summary>
+        /// <c>Downloading &lt;文件&gt; (&lt;体积&gt;)</c> —— uv 与 pip <b>共用</b>这一条。
+        ///
+        /// <para>⚠ <b>体积单位必须同时认大小写，且要认 <c>bytes</c></b>。
+        /// 这条正则原先是照着 <b>uv</b> 写的，只有 <c>[KMGT]?i?B</c>（大写 + 二进制单位）；
+        /// 而 <b>pip 用的是小写 <c>kB</c></b>，并且极小包会写成 <c>512 bytes</c>。实测：</para>
+        /// <list type="bullet">
+        ///   <item><c>Downloading onnxruntime-...whl (14.3 MB)</c> → 老写法能认</item>
+        ///   <item><c>Downloading cowsay-6.1-py3-none-any.whl (25 kB)</c> → <b>老写法认不出</b>
+        ///         （<c>[KMGT]</c> 不含小写 k）</item>
+        /// </list>
+        /// <para>pip 的体积分档是 <c>format_size()</c>：<c>&gt;1e6 → MB</c>、<c>&gt;1e4 → kB</c>、
+        /// <c>&gt;1e3 → x.x kB</c>、否则 <c>N bytes</c> —— 所以小写 k 与 bytes 都是常规情况，
+        /// 不是边角。单位统一在 <see cref="ParseBytes"/> 里 <c>ToUpperInvariant</c> 后换算。</para>
+        /// </summary>
         private static readonly System.Text.RegularExpressions.Regex RxDownloading =
-            new System.Text.RegularExpressions.Regex(@"^\s*Downloading\s+(\S+)\s*\(([\d.]+)\s*([KMGT]?i?B)\)",
+            new System.Text.RegularExpressions.Regex(@"^\s*Downloading\s+(\S+)\s*\(([\d.]+)\s*([KMGTkmgt]?i?B|bytes)\)",
                 System.Text.RegularExpressions.RegexOptions.Compiled);
         private static readonly System.Text.RegularExpressions.Regex RxDownloaded =
-            new System.Text.RegularExpressions.Regex(@"^\s*Downloaded\s+(\S+?)(?:\s*\(([\d.]+)\s*([KMGT]?i?B)\))?\s*$",
+            new System.Text.RegularExpressions.Regex(@"^\s*Downloaded\s+(\S+?)(?:\s*\(([\d.]+)\s*([KMGTkmgt]?i?B|bytes)\))?\s*$",
                 System.Text.RegularExpressions.RegexOptions.Compiled);
         private static readonly System.Text.RegularExpressions.Regex RxPrepared =
             new System.Text.RegularExpressions.Regex(@"^\s*Prepared\s+\d+\s+packages?",
                 System.Text.RegularExpressions.RegexOptions.Compiled);
         private static readonly System.Text.RegularExpressions.Regex RxInstalled =
             new System.Text.RegularExpressions.Regex(@"^\s*Installed\s+\d+\s+packages?",
+                System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        // ---- pip 的对应版本 ----
+        // 上面那几条是照着 **uv** 的措辞写的（Resolved / Prepared / Installed）。
+        // 但扩展自带的 install.py 走的是**真 pip**（`sys.executable -m pip`），
+        // 它的措辞完全不同 —— 不补这两条，pip 装依赖期间状态栏会一直停在上一句话上。
+        //   pip: "Installing collected packages: foo, bar"  ↔  uv: "Prepared 2 packages"
+        //   pip: "Successfully installed foo-1.0 bar-2.0"   ↔  uv: "Installed 2 packages"
+        // 注：pip 没有 uv "Resolved N packages" 的等价输出（它是逐行 "Collecting X"），
+        // 所以「正在解析依赖」这一段对 pip 不适用，直接从「正在下载依赖」开始 —— 不改。
+        private static readonly System.Text.RegularExpressions.Regex RxPipInstalling =
+            new System.Text.RegularExpressions.Regex(@"^\s*Installing collected packages:",
+                System.Text.RegularExpressions.RegexOptions.Compiled);
+        private static readonly System.Text.RegularExpressions.Regex RxPipInstalled =
+            new System.Text.RegularExpressions.Regex(@"^\s*Successfully installed\s+\S",
                 System.Text.RegularExpressions.RegexOptions.Compiled);
 
         /// <summary>进入「在动」状态：滑动条 + 每秒刷新已用时间。必须在 UI 线程调用。</summary>
@@ -2483,8 +2526,11 @@ namespace ForgeNeoLauncher
 
             // 这两行意味着"下载那套百分比到此为止" —— 从百分比模式退回来，
             // 否则进度条会一直停在最后一个百分比上，跟状态行说的不是一回事
-            if (RxPrepared.IsMatch(text)) { mainPhase = "正在安装依赖"; LeavePercentMode(); return; }
-            if (RxInstalled.IsMatch(text)) { mainPhase = "依赖已装好，正在启动"; LeavePercentMode(); return; }
+            // （uv 与 pip 两套措辞都认，见 RxPipInstalling 上方注释）
+            if (RxPrepared.IsMatch(text) || RxPipInstalling.IsMatch(text))
+            { mainPhase = "正在安装依赖"; LeavePercentMode(); return; }
+            if (RxInstalled.IsMatch(text) || RxPipInstalled.IsMatch(text))
+            { mainPhase = "依赖已装好，正在启动"; LeavePercentMode(); return; }
         }
 
         private void NotePackage(string name, string size, string unit, bool finished)
@@ -2503,6 +2549,8 @@ namespace ForgeNeoLauncher
             if (!double.TryParse(size, out double v)) return 0;
             switch ((unit ?? "").ToUpperInvariant())
             {
+                // pip 的极小包会写成 "N bytes"（见 RxDownloading 注释）—— 按 1 字节算
+                case "BYTES": return (long)v;
                 case "KIB": case "KB": return (long)(v * 1024);
                 case "MIB": case "MB": return (long)(v * 1048576);
                 case "GIB": case "GB": return (long)(v * 1073741824);

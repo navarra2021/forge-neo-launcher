@@ -542,7 +542,7 @@
                     <TextBlock Text="Forge Neo 启动器" FontSize="12.5" Margin="8,0,0,0"
                                VerticalAlignment="Center"
                                Foreground="{DynamicResource TitleBarText}"/>
-                    <TextBlock x:Name="TitleVersionText" Text="v0.26" FontSize="11" Margin="7,0,0,0"
+                    <TextBlock x:Name="TitleVersionText" Text="v0.27" FontSize="11" Margin="7,0,0,0"
                                VerticalAlignment="Center"
                                Foreground="{DynamicResource SubtitleText}"/>
                 </StackPanel>
@@ -594,7 +594,7 @@
                                    HorizontalAlignment="Center" Margin="0,6,0,0"/>
                         <Border Background="{DynamicResource CardBg}" BorderBrush="{DynamicResource CardBorder}"
                                 BorderThickness="1" CornerRadius="4" Padding="5,1" Margin="0,4,0,0">
-                            <TextBlock x:Name="LogoVersionText" Text="v0.26"
+                            <TextBlock x:Name="LogoVersionText" Text="v0.27"
                                        Foreground="{DynamicResource SubtitleText}" FontSize="8.5"
                                        HorizontalAlignment="Center"/>
                         </Border>
@@ -1053,7 +1053,7 @@
                                                Foreground="{DynamicResource TopBtnText}" VerticalAlignment="Center"/>
                                     <Border Background="{DynamicResource CardBg}" BorderBrush="{DynamicResource CardBorder}"
                                             BorderThickness="1" CornerRadius="4" Padding="6,2" Margin="10,0,0,0" VerticalAlignment="Center">
-                                        <TextBlock x:Name="VerLauncherVerText" Text="启动器 v0.26"
+                                        <TextBlock x:Name="VerLauncherVerText" Text="启动器 v0.27"
                                                    Foreground="{DynamicResource SubtitleText}" FontSize="10.5"/>
                                     </Border>
                                     <TextBlock x:Name="VerStatusText" Text="" FontSize="12" Margin="14,0,0,0"
@@ -1424,7 +1424,7 @@
                                                     <StackPanel>
                                                         <TextBlock Text="启动时检查并补装扩展依赖" Style="{StaticResource AdvLabel}"/>
                                                         <TextBlock Style="{StaticResource AdvHint}" Margin="0,2,12,0" TextWrapping="Wrap"
-                                                                   Text="控制是否发送 --skip-install。开启时每次启动会逐个执行扩展自带的 install.py，把缺的第三方包装上（已装好的会跳过，只多几秒）。关闭则不安装任何东西、启动最快，但新装的扩展可能因缺少依赖而加载失败。"/>
+                                                                   Text="控制是否发送 --skip-install。⚠ 默认关闭：多数扩展的依赖声明只写裸包名（不带版本），pip 会按「装最新」解析，可能把 Forge 钉死的包顶掉 —— 实测 wd14-tagger 的 tensorflow 会把 protobuf 顶到 7.x，导致 Forge 彻底起不来。只有新装了扩展、且它确实缺包时才打开，装完请关回去。"/>
                                                     </StackPanel>
                                                 </DockPanel>
                                             </StackPanel>

@@ -63,6 +63,185 @@ namespace ForgeNeoLauncher
             psi.Environment["UV_NO_MODIFY_PATH"] = "1";
         }
 
+        /// <summary>pip 日志超过这个大小就轮转（留一代，磁盘占用上限 ≈ 2×）</summary>
+        private const long PipLogRotateBytes = 8L * 1024 * 1024;
+
+        /// <summary>
+        /// 让「装依赖」这件事<b>在日志里看得见</b>。
+        ///
+        /// <para><b>要解决的问题</b>：扩展自带的 <c>install.py</c> 里写死了 <c>pip install -q</c>
+        /// （如 wd14-tagger 的 <c>install.py:11</c>）—— <c>-q</c> 是「完全静默」，
+        /// 于是日志窗口<b>一个字都不动</b>，看上去像卡死，其实在龟速下载。
+        /// 而下载发生在 webui 起来之前：端口不监听、进度条没有依据只能一直转圈，
+        /// 使用者完全无从判断"它在干活还是在死等"。</para>
+        ///
+        /// <para><b>两个互补的手段</b>（2026-09-17 实测，见下）：</para>
+        /// <list type="number">
+        ///   <item><c>PIP_VERBOSE=1</c> —— <b>把 <c>-q</c> 抵消掉，实时输出进日志窗口</b>。
+        ///         pip 的 <c>-q</c> 与 <c>-v</c> 共用<b>同一个计数器</b>，
+        ///         命令行给了 <c>-q</c>（−1），环境变量再给 <c>+1</c> → 净 0 = 正常输出。
+        ///         实测（同一份 <c>cowsay==6.1</c>，唯一变量是这个变量）：
+        ///         不加时输出 <b>0 行</b>；加了之后下面 5 行全部出现 ——
+        ///         <c>Looking in indexes</c> / <c>Collecting</c> /
+        ///         <c>Downloading X.whl (25 kB)</c> / <c>Installing collected packages</c> /
+        ///         <c>Successfully installed</c>。
+        ///         <b>这是本项目第一条能击穿别人写死的 <c>-q</c> 的手段 —— 不需要改扩展的
+        ///         任何文件</b>（改了下游一更新就没了）。</item>
+        ///   <item><c>PIP_LOG=&lt;file&gt;</c> —— <b>命令行能被 <c>-q</c> 关掉，日志文件关不掉</b>。
+        ///         实测：<c>-q</c> 下 stdout 仍是 0 行，但日志文件里拿到了完整记录
+        ///         （5500 字节：连 <c>Starting new HTTPS connection (1): host:443</c>、
+        ///         <c>"GET /simple/xxx/ HTTP/1.1" 200</c> 这类 HTTP 级细节都在）。
+        ///         用途是<b>事后取证</b>：出问题时把这个文件发出来就能复盘。</item>
+        /// </list>
+        ///
+        /// <para><b>⚠ 刻意不设 <c>PIP_PROGRESS_BAR</c></b>：它在管道（非 TTY）下<b>实测无效</b> ——
+        /// 设 <c>on</c> / 设 <c>off</c> / 完全不设，三种情况输出<b>一字不差</b>。
+        /// 而大文件下载时那行进度快照（<c>-------- 14.3/14.3 MB 65.9 MB/s 0:00:00</c>）
+        /// 是 <c>PIP_VERBOSE=1</c> 自己带来的：只给 <c>PIP_PROGRESS_BAR=on</c>
+        /// 而不给 <c>PIP_VERBOSE</c> 时，输出仍是 <b>0 行</b>。
+        /// 设一个不起作用的变量只会让人误以为它在起作用，故不留。</para>
+        ///
+        /// <para><b>还实测了安全性</b>（怕 verbose 把日志刷爆 / 灌 ANSI 转义码）：
+        /// 打开 <c>PIP_VERBOSE</c> 后一个包只多 5~6 字节的 <c>\r</c>，
+        /// <b>ANSI 转义序列为 0</b> —— 非 TTY 下 pip 自己降级成纯文本，
+        /// 进启动器的日志窗口是干净的。（对比：WPF 里显示 <c>rich</c> 的彩色进度条会变成一堆乱码。）</para>
+        ///
+        /// <para><b>顺带一个巧合</b>：pip 的 <c>Downloading X.whl (25 kB)</c> 与 uv 的
+        /// <c>Downloading X (25.0KiB)</c> 形状一致，正好被启动器既有的
+        /// <c>RxDownloading</c> 正则认出来 → 进度条能据此统计"已下载多少体积"。</para>
+        ///
+        /// <para>⚠ <b>uv 没有对应手段</b>：实测 <c>UV_VERBOSE=1</c> 打不穿 uv 的 <c>-q</c>。
+        /// 但影响不大 —— Forge 自己调 uv 的那条路（<c>run_pip</c>）本来就不加 <c>-q</c>，
+        /// 只有扩展自己写死的 pip 调用才静默，而它们走的是真 pip（<c>sys.executable -m pip</c>），
+        /// 正好被上面两条覆盖。</para>
+        /// </summary>
+        public static void ApplyDependencyVisibilityEnv(ProcessStartInfo psi)
+        {
+            // ① 实时：抵消扩展 install.py 里那个写死的 -q
+            psi.Environment["PIP_VERBOSE"] = "1";
+
+            // ② 取证：全量日志落文件。
+            // ⚠ 目录必须先建好：pip 的 FileHandler 只建文件不建目录，
+            //   路径不存在时它会报错 → **宁可不要这个变量，也不能让它把启动带崩**。
+            try
+            {
+                Directory.CreateDirectory(AppPaths.LogsDir);
+
+                var cur = new FileInfo(AppPaths.PipLogFile);
+                if (cur.Exists && cur.Length > PipLogRotateBytes)
+                    File.Move(AppPaths.PipLogFile, AppPaths.PipLogPrevFile, overwrite: true);
+
+                psi.Environment["PIP_LOG"] = AppPaths.PipLogFile;
+            }
+            catch
+            {
+                // 日志落盘失败（目录只读 / 磁盘满 / 杀软拦截）不影响启动：
+                // 实时输出那条路已经够用，不能为了诊断能力把主流程搭进去。
+            }
+        }
+
+        // ==================== 钉版约束（保护 Forge 的依赖不被扩展顶掉） ====================
+
+        /// <summary>只认「包名==版本」这种钉死写法；裸包名不收（那正是我们要防的东西）</summary>
+        private static readonly System.Text.RegularExpressions.Regex PinnedRequirementRe =
+            new System.Text.RegularExpressions.Regex(@"^[A-Za-z0-9_.\-]+==",
+                System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        private const string ConstraintsHeader =
+            "# 本文件由 Forge Neo 启动器自动生成，请勿手工编辑（每次启动会按 requirements.txt 重算）。\n" +
+            "#\n" +
+            "# 内容：Forge 的 requirements.txt 里所有「包名==版本」行。\n" +
+            "# 用途：通过 PIP_CONSTRAINT / UV_CONSTRAINT 交给 pip 与 uv。\n" +
+            "#       constraint 只限制版本、不会主动安装任何包 ——\n" +
+            "#       所以它等于在说「这些包只能选这些版本」。\n" +
+            "#\n" +
+            "# 为什么需要：扩展自带的 install.py 通常是 `pip install -r requirements.txt`，\n" +
+            "#   而多数扩展的 requirements 只写裸包名（wd14-tagger 的 14 行里 13 行是裸的），\n" +
+            "#   pip 对裸包名一律「装最新」，于是把 Forge 钉死的版本顶掉。\n" +
+            "#   ⚠ 被顶掉还不致命（Forge 启动时会把钉版修回来），\n" +
+            "#     致命的是被装进来的那个包本身：tensorflow 需要 protobuf>=6.31.1，\n" +
+            "#     与本文件钉的 protobuf==4.25.9 不可兼得 ——\n" +
+            "#     而 tensorflow 只要躺在 site-packages 里，Forge 导入 transformers 时就会崩。\n" +
+            "#   所以本文件会让这类扩展判定无解并退出（ERROR: ResolutionImpossible）。\n" +
+            "#   这是**刻意的**：宁可那个扩展的依赖装不上，也不能让 Forge 起不来。\n" +
+            "#\n";
+
+        /// <summary>
+        /// 生成/刷新 <see cref="AppPaths.PipConstraintsFile"/>：把 Forge 在
+        /// <c>requirements.txt</c> 里<b>钉死的版本</b>抄成 pip 的 constraint 文件。
+        /// 返回写进去的条目数（0 表示没生成）。
+        ///
+        /// <para>⚠ <b>只从 requirements.txt 自动提取</b>，不手工追加猜测的包名 ——
+        /// 「该保护什么」的唯一权威来源就是 Forge 自己钉的那份清单。</para>
+        ///
+        /// <para>⚠ <b>已知代价</b>：pip 判定"无解"时会逐一回溯候选版本，可能很慢
+        /// （实测一次完整的 <c>--ignore-installed</c> dry-run 约 7 分钟）。
+        /// 所以它只是<b>兜底</b>，主防线是 <c>AdvancedOptions.InstallExtDeps</c> 默认关。</para>
+        /// </summary>
+        public static int RefreshPipConstraints()
+        {
+            try
+            {
+                var req = Path.Combine(AppPaths.Root, "requirements.txt");
+                if (!File.Exists(req)) return 0;
+
+                var lines = new List<string>();
+                foreach (var raw in File.ReadAllLines(req))
+                {
+                    var ln = raw.Trim();
+                    if (ln.Length == 0 || ln[0] == '#') continue;
+                    if (!PinnedRequirementRe.IsMatch(ln)) continue;
+                    lines.Add(ln);
+                }
+                if (lines.Count == 0) return 0;
+
+                var text = ConstraintsHeader + string.Join("\n", lines) + "\n";
+
+                // 内容没变就不重写 —— 保留 mtime 的诊断价值（"这文件什么时候变的"）
+                var same = File.Exists(AppPaths.PipConstraintsFile) &&
+                           File.ReadAllText(AppPaths.PipConstraintsFile) == text;
+                if (!same)
+                {
+                    Directory.CreateDirectory(AppPaths.RuntimeDir);
+                    File.WriteAllText(AppPaths.PipConstraintsFile, text, new UTF8Encoding(false));
+                }
+
+                return lines.Count;
+            }
+            catch
+            {
+                // 约束是**兜底**，不是主流程：生成失败也不该影响启动
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// 把钉版约束挂到子进程上。
+        ///
+        /// <para>两个变量名都已实测确认：pip 认 <c>PIP_CONSTRAINT</c>，
+        /// uv 认 <c>UV_CONSTRAINT</c>（见 <c>uv pip install --help</c> 里的
+        /// <c>[env: UV_CONSTRAINT=]</c>）。</para>
+        ///
+        /// <para>约束文件生成失败（或 requirements.txt 读不到）时<b>什么都不设</b> ——
+        /// 一个指向不存在文件的 constraint 会让 pip 直接报错退出，
+        /// 那等于把"兜底"变成"主流程故障"。</para>
+        /// </summary>
+        public static void ApplyConstraintEnv(ProcessStartInfo psi)
+        {
+            try
+            {
+                if (RefreshPipConstraints() == 0) return;
+                if (!File.Exists(AppPaths.PipConstraintsFile)) return;
+
+                psi.Environment["PIP_CONSTRAINT"] = AppPaths.PipConstraintsFile;
+                psi.Environment["UV_CONSTRAINT"] = AppPaths.PipConstraintsFile;
+            }
+            catch
+            {
+                // 同上：兜底失败就退化成"没有兜底"，不能被它带崩
+            }
+        }
+
         // ==================== 建 venv ====================
 
         /// <summary>

@@ -244,9 +244,11 @@ namespace ForgeNeoLauncher
             if (!AutoOpenBrowser)
                 list.Add("已关闭「就绪后自动打开界面」：服务起来后不会再弹浏览器，需要时点主界面的【打开界面】。");
 
-            if (!InstallExtDeps)
-                list.Add("已关闭「启动时补装扩展依赖」：新装扩展自身的依赖不会被自动安装，"
-                       + "该扩展可能因缺少第三方包而加载失败。装完新扩展后建议临时打开一次。");
+            if (InstallExtDeps)
+                list.Add("已开启「启动时补装扩展依赖」（默认是关）：本次启动会逐个执行各扩展的 "
+                       + "install.py。注意多数扩展的依赖声明不带版本号，pip 会按「装最新」解析，"
+                       + "可能把 Forge 钉死的包顶掉 —— 实测 wd14-tagger 的 tensorflow 会让 Forge "
+                       + "彻底起不来。只在新装扩展时临时打开，装完建议关回去。");
 
             return list;
         }
@@ -266,9 +268,9 @@ namespace ForgeNeoLauncher
             LauncherConfig.SetBool("Adv.Api", Api);
             LauncherConfig.SetBool("Adv.Listen", Listen);
             LauncherConfig.Set("Adv.GradioAuth", GradioAuth ?? "");
-            // ⚠ 默认值必须与 Load() 的兜底一致（都是 true）：老配置文件里没这一项时，
-            //   读到的是"开" —— 这样升级上来的用户立刻获得"扩展依赖会被自动补装"，
-            //   而他们之前恰恰卡在这件事上。
+            // ⚠ 默认值必须与 Load() 的兜底一致（都是 false）：cfg 里没这一项时读到「关」。
+            //   默认值由 true 改为 false 是 2026-09-17 基于实测的修正 ——
+            //   理由见字段声明处「踩过的坑（二）」。
             LauncherConfig.SetBool("Adv.InstallExtDeps", InstallExtDeps);
             // ⚠ 下载源必须落盘：不存的话重启就退回默认的「国内加速」，
             //   用户明明切到了官方源、下次打开又变回去 —— 属于静默篡改用户选择
@@ -311,7 +313,7 @@ namespace ForgeNeoLauncher
         {
             NoHashing = false; Autotune = false; PinSharedMemory = false; ExpandableSegments = false;
             AutoOpenBrowser = true; Api = false; Listen = false; GradioAuth = "";
-            InstallExtDeps = true;
+            InstallExtDeps = false;
             MirrorSource = ForgeNeoLauncher.DownloadSource.Cn;
             UseA1111Home = false; A1111Home = "";
             CkptDirs.Clear(); LoraDirs.Clear(); VaeDirs.Clear();

@@ -110,6 +110,34 @@ namespace ForgeNeoLauncher
         /// <summary>临时目录（缓存/临时文件，删了不影响环境）</summary>
         public static string TmpDir => Path.Combine(Root, "tmp");
 
+        /// <summary>
+        /// 诊断日志目录 —— 启动器/子进程为「排查用」留下的文本记录，<b>删掉不影响环境</b>。
+        /// 与 <see cref="OutputDir"/> 刻意分开：那里是用户的出图，这里是我们自己的日志。
+        /// </summary>
+        public static string LogsDir => Path.Combine(Root, "logs");
+
+        /// <summary>
+        /// pip 的<b>全量</b>安装日志（见 <see cref="DeployManager.ApplyDependencyVisibilityEnv"/>）。
+        /// pip 以追加方式写，故由启动器按大小轮转 —— 见 <see cref="PipLogPrevFile"/>。
+        /// </summary>
+        public static string PipLogFile => Path.Combine(LogsDir, "pip-install.log");
+
+        /// <summary>轮转后的上一份 pip 日志（只保留一代，避免日志目录无限膨胀）</summary>
+        public static string PipLogPrevFile => Path.Combine(LogsDir, "pip-install.prev.log");
+
+        /// <summary>
+        /// <b>钉版约束文件</b> —— 路径交给 pip / uv 的 <c>--constraint</c>，
+        /// 让扩展自带的 <c>install.py</c> 无法顶掉 Forge 钉死的版本。
+        ///
+        /// <para>内容与生成时机见 <see cref="DeployManager.RefreshPipConstraints"/>，
+        /// 注入方式见 <see cref="DeployManager.ApplyConstraintEnv"/>。</para>
+        ///
+        /// <para>放在 <c>runtime\</c> 而不是随包发布：它是启动器<b>按 Forge 当前的
+        /// <c>requirements.txt</c> 现算现写</b>的派生文件 —— Forge 升级改了钉版，
+        /// 下次启动就会跟着变，不需要我们手工同步。</para>
+        /// </summary>
+        public static string PipConstraintsFile => Path.Combine(RuntimeDir, "pip-constraints.txt");
+
         /// <summary>输出根目录 —— 注意是 output，单数</summary>
         public static string OutputDir => Path.Combine(Root, "output");
 
