@@ -59,6 +59,39 @@ namespace ForgeNeoLauncher
         public string GradioAuth = "";
 
         /// <summary>
+        /// 启动时检查并补装扩展依赖（默认<b>开</b>）。
+        ///
+        /// <para><b>它控制 <c>--skip-install</c> 发不发</b>，而不是普通的启动参数 ——
+        /// 所以不进 <see cref="AppendTo"/>，由 <c>MainWindow.BuildFinalArgs()</c> 统一裁决。
+        /// 键名仍落在 <c>Adv.</c> 前缀下，便于和其余高级选项一起读写。</para>
+        ///
+        /// <para><b>为什么需要这个开关</b>：<c>--skip-install</c> 在 Forge 里是<b>一票制</b>，
+        /// 它同时关掉三件事：</para>
+        /// <list type="number">
+        ///   <item><c>launch_utils.run_pip()</c> 的第一行 <c>if args.skip_install: return</c>
+        ///         —— 所有在线安装（onnxruntime 等）</item>
+        ///   <item><c>prepare_environment()</c> 里的 <c>install_requirements()</c></item>
+        ///   <item><c>run_extensions_installers()</c> —— 逐个执行 <c>extensions/*/install.py</c></item>
+        /// </list>
+        ///
+        /// <para><b>踩过的坑</b>：原先的判据是 <c>if (HasTorch) 加 --skip-install</c>。
+        /// 看着合理（"依赖装好了就不用再装"），实则<b>只对第 1、2 件成立</b> ——
+        /// 第 3 件（扩展依赖）与 torch 在不在毫无关系。
+        /// 于是只要 torch 装好，<b>以后再装任何扩展，它的 <c>install.py</c> 永远跑不到</b>，
+        /// 表现为「扩展报 <c>ModuleNotFoundError: 某个第三方包</c>」——
+        /// 症状离原因极远，排查起来非常绕（wd14-tagger 缺 <c>jsonschema</c> 就是这么来的）。
+        /// </para>
+        ///
+        /// <para>⚠ <b>判据不能兼职</b>：<c>HasTorch</c> 回答的是"torch 在不在"，
+        /// 它回答不了"扩展依赖要不要补"。这两件事必须分开问。</para>
+        ///
+        /// <para><b>代价</b>：开着时每次启动会跑一遍各扩展的 <c>install.py</c>。
+        /// 但 <c>requirements_met()</c> / <c>is_installed()</c> 的守卫会让已装好的依赖
+        /// 直接跳过，实测只多几秒。关掉可换回最快启动。</para>
+        /// </summary>
+        public bool InstallExtDeps = true;
+
+        /// <summary>
         /// 依赖下载源档位：<c>cn</c>（国内加速，默认）/ <c>official</c>（官方源）。
         ///
         /// <para>名字不叫 DownloadSource 是为了避开与 <see cref="ForgeNeoLauncher.DownloadSource"/>
@@ -211,6 +244,10 @@ namespace ForgeNeoLauncher
             if (!AutoOpenBrowser)
                 list.Add("已关闭「就绪后自动打开界面」：服务起来后不会再弹浏览器，需要时点主界面的【打开界面】。");
 
+            if (!InstallExtDeps)
+                list.Add("已关闭「启动时补装扩展依赖」：新装扩展自身的依赖不会被自动安装，"
+                       + "该扩展可能因缺少第三方包而加载失败。装完新扩展后建议临时打开一次。");
+
             return list;
         }
 
@@ -229,6 +266,10 @@ namespace ForgeNeoLauncher
             LauncherConfig.SetBool("Adv.Api", Api);
             LauncherConfig.SetBool("Adv.Listen", Listen);
             LauncherConfig.Set("Adv.GradioAuth", GradioAuth ?? "");
+            // ⚠ 默认值必须与 Load() 的兜底一致（都是 true）：老配置文件里没这一项时，
+            //   读到的是"开" —— 这样升级上来的用户立刻获得"扩展依赖会被自动补装"，
+            //   而他们之前恰恰卡在这件事上。
+            LauncherConfig.SetBool("Adv.InstallExtDeps", InstallExtDeps);
             // ⚠ 下载源必须落盘：不存的话重启就退回默认的「国内加速」，
             //   用户明明切到了官方源、下次打开又变回去 —— 属于静默篡改用户选择
             LauncherConfig.Set("Adv.MirrorSource", ForgeNeoLauncher.DownloadSource.Normalize(MirrorSource));
@@ -253,6 +294,8 @@ namespace ForgeNeoLauncher
                 Api = LauncherConfig.GetBool("Adv.Api"),
                 Listen = LauncherConfig.GetBool("Adv.Listen"),
                 GradioAuth = LauncherConfig.Get("Adv.GradioAuth"),
+                // 默认 true：老配置文件缺这一项时升级即生效（与 Save() 的默认值一致）
+                InstallExtDeps = LauncherConfig.GetBool("Adv.InstallExtDeps", true),
                 // Normalize 兜底：老配置文件里没这一项时读到空串，会退化成默认值
                 MirrorSource = ForgeNeoLauncher.DownloadSource.Normalize(LauncherConfig.Get("Adv.MirrorSource")),
 
@@ -268,6 +311,7 @@ namespace ForgeNeoLauncher
         {
             NoHashing = false; Autotune = false; PinSharedMemory = false; ExpandableSegments = false;
             AutoOpenBrowser = true; Api = false; Listen = false; GradioAuth = "";
+            InstallExtDeps = true;
             MirrorSource = ForgeNeoLauncher.DownloadSource.Cn;
             UseA1111Home = false; A1111Home = "";
             CkptDirs.Clear(); LoraDirs.Clear(); VaeDirs.Clear();

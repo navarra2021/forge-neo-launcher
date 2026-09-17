@@ -59,10 +59,25 @@ namespace ForgeNeoLauncher
             if (File.Exists(AppPaths.UvExe))
                 list.Add("--uv");
 
-            // --skip-install：只在依赖确实装好之后才跳过。
-            // 薄包首装时 venv 还是空的，此时跳过安装 = 让 Forge 裸奔启动（缺 torch 直接崩），
-            // 所以首次必须放开，交给它自己的 prepare_environment() 把依赖装上。
-            if (AppPaths.HasTorch)
+            // --skip-install：**一票制**，一旦发出，三件事全关：
+            //   ① launch_utils.run_pip() 第一行的 `if args.skip_install: return`（所有在线安装）
+            //   ② install_requirements()（Forge 主依赖）
+            //   ③ run_extensions_installers()（各扩展自己的 install.py）
+            //
+            // ⚠ 这里原先的判据是 `if (AppPaths.HasTorch)` —— **判据兼职，错在这**：
+            //   它只对 ①② 成立（torch 在就不必重装主依赖），对 ③ 完全不成立。
+            //   扩展依赖与 torch 毫无关系，于是结果是「torch 一装好，
+            //   以后装任何扩展都不会再执行它的 install.py」——
+            //   症状是扩展报某个第三方包 ModuleNotFoundError，离原因极远。
+            //
+            // 现在拆成两个独立的问题：
+            //   ① torch 缺失（薄包首装）→ **必须**放开安装，否则缺 torch 直接崩
+            //   ② advOpts.InstallExtDeps（默认开）→ 用户选择要不要顺带补扩展依赖
+            // 任一为真就不发 --skip-install。
+            //
+            // 代价可控：Forge 侧 requirements_met() / is_installed() 会挡住已装好的依赖，
+            // 只有各扩展的 install.py 会真跑一遍 pip（几秒）。
+            if (AppPaths.HasTorch && !advOpts.InstallExtDeps)
                 list.Add("--skip-install");
 
             advOpts.AppendTo(list);
@@ -2877,6 +2892,7 @@ namespace ForgeNeoLauncher
                 SwApi.IsChecked = advOpts.Api;
                 SwListen.IsChecked = advOpts.Listen;
                 AuthBox.Text = advOpts.GradioAuth;
+                SwInstallExtDeps.IsChecked = advOpts.InstallExtDeps;
 
                 SwA1111Home.IsChecked = advOpts.UseA1111Home;
                 A1111Box.Text = advOpts.A1111Home;
@@ -3024,6 +3040,8 @@ namespace ForgeNeoLauncher
             advOpts.Api = SwApi.IsChecked == true;
             advOpts.Listen = SwListen.IsChecked == true;
             advOpts.GradioAuth = AuthBox.Text ?? "";
+            // 它不进 AppendTo —— 由 BuildFinalArgs() 裁决发不发 --skip-install
+            advOpts.InstallExtDeps = SwInstallExtDeps == null || SwInstallExtDeps.IsChecked == true;
             advOpts.MirrorSource = (SourceBox?.SelectedItem as SourceOption)?.Id
                                    ?? ForgeNeoLauncher.DownloadSource.Cn;
 

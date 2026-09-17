@@ -783,9 +783,9 @@
                                      （用户原话：「放大到全屏就走样了」）。
                                      现在改成 Stretch=Uniform：盒宽变大时图片**跟着长高**，
                                      任何窗口尺寸下都是完整一张图、也不留空边。
-                                    资源由源图按同一比例裁出；
-                                    静态检查规则 14 改为挡住"写死 Height / 用
-                                    UniformToFill"这种回退写法。 -->
+                                     资源仍由 _icon_work/_mkbanner.py 从源图裁出；
+                                     check_wiring 第 14 节改为挡住"写死 Height / 用
+                                     UniformToFill"这种回退写法。 -->
                                 <Border x:Name="HomeBannerBox" CornerRadius="12" ClipToBounds="True" Margin="0,0,0,16">
                                     <Grid>
                                         <!-- Stretch=Uniform（不是 UniformToFill）：内容永远完整，
@@ -1413,6 +1413,23 @@
                                 <!-- === 服务与网络 === -->
                                 <ScrollViewer x:Name="PaneService" VerticalScrollBarVisibility="Auto" Visibility="Collapsed">
                                     <StackPanel>
+                                        <Border Background="{DynamicResource CardBg}" BorderBrush="{DynamicResource CardBorder}"
+                                                BorderThickness="1" CornerRadius="10" Padding="16,13" Margin="0,0,0,10">
+                                            <StackPanel>
+                                                <TextBlock Text="扩展与依赖" Style="{StaticResource AdvLabel}" FontWeight="SemiBold"/>
+                                                <TextBlock Text="决定启动时要不要顺带维护第三方扩展的依赖。" Style="{StaticResource AdvHint}" Margin="0,2,0,10"/>
+                                                <DockPanel>
+                                                    <ToggleButton x:Name="SwInstallExtDeps" DockPanel.Dock="Right" Style="{StaticResource Switch}"
+                                                                  VerticalAlignment="Center" Checked="AdvOption_Toggled" Unchecked="AdvOption_Toggled"/>
+                                                    <StackPanel>
+                                                        <TextBlock Text="启动时检查并补装扩展依赖" Style="{StaticResource AdvLabel}"/>
+                                                        <TextBlock Style="{StaticResource AdvHint}" Margin="0,2,12,0" TextWrapping="Wrap"
+                                                                   Text="控制是否发送 --skip-install。开启时每次启动会逐个执行扩展自带的 install.py，把缺的第三方包装上（已装好的会跳过，只多几秒）。关闭则不安装任何东西、启动最快，但新装的扩展可能因缺少依赖而加载失败。"/>
+                                                    </StackPanel>
+                                                </DockPanel>
+                                            </StackPanel>
+                                        </Border>
+
                                         <Border Background="{DynamicResource CardBg}" BorderBrush="{DynamicResource CardBorder}"
                                                 BorderThickness="1" CornerRadius="10" Padding="16,13" Margin="0,0,0,10">
                                             <StackPanel>
