@@ -19,10 +19,18 @@ namespace ForgeNeoLauncher
     ///         拼成 torch 的 <c>--extra-index-url</c>，管的是 torch / torchvision 的 wheel</item>
     /// </list>
     ///
+    /// <para>⚠ 另有一个 <c>PIP_INDEX_URL</c>（见 <c>DeployManager.ApplySourceEnv</c>）：
+    /// 那是给**绕过 Forge 的 run_pip、直接调 pip 的脚本**兜底用的 ——
+    /// 扩展自带的 <c>install.py</c> 就是这种（它直接 <c>python -m pip install</c>，
+    /// 只认 <c>PIP_INDEX_URL</c>，看不到 <c>INDEX_URL</c>）。</para>
+    ///
     /// <para><b>镜像选型是实测出来的，不是抄教程</b>（2026-09-13 本机实测）：</para>
     /// <list type="bullet">
-    ///   <item>阿里云 PyPI <c>mirrors.aliyun.com/pypi/simple/</c> —— 标准 PEP503，可用；
-    ///         实测 <c>uv pip install packaging==26.2</c> 0.4 秒完成</item>
+    ///   <item>⚠ 阿里云 PyPI <c>mirrors.aliyun.com/pypi/simple/</c> —— 结构合规、
+    ///         <b>元数据解析</b>确实快（<c>uv pip install packaging==26.2</c> 0.4 秒），
+    ///         但 2026-09-17 补测<b>大文件吞吐</b>才发现它慢到不可用（见下），<b>已弃用</b></item>
+    ///   <item>✅ 清华 TUNA <c>pypi.tuna.tsinghua.edu.cn/simple/</c> —— <b>现在的默认</b>；
+    ///         三轮实测 4.48 / 2.88 / 6.84 MB/s，是四家里唯一三轮都稳的</item>
     ///   <item>上海交大 <c>mirror.sjtu.edu.cn/pytorch-wheels/&lt;支线&gt;/</c> —— PEP503 结构，
     ///         实测解析 torch 2.13.0+cu130 + torchvision 0.28.0+cu130 得 13 个包，
     ///         1.2 秒（比官方 4.1 秒还快），且 cu130 / cu128 / cu126 三条支线都在</item>
@@ -32,10 +40,25 @@ namespace ForgeNeoLauncher
     ///         （<c>/cu130/torch/</c> 返回 404），只能配 <c>--find-links</c>，
     ///         接不进 Forge 现有的 <c>--extra-index-url</c> 链路，同样不采用</item>
     /// </list>
+    ///
+    /// <para><b>⚠⚠ 2026-09-17 补测：选镜像只测「解析快不快」是不够的。</b>
+    /// 当初选阿里云，依据是 <c>uv pip install packaging==26.2</c> 0.4 秒 ——
+    /// 那测的是 <b>元数据解析</b>，而真正决定用户体验的是 <b>大文件吞吐</b>。
+    /// 用同一份 <c>tensorflow-2.21.0rc1-cp313-cp313-win_amd64.whl</c> 实测（各下 8 MB，
+    /// 同一台机、同一个 URL，唯一变量是镜像）：</para>
+    /// <list type="table">
+    ///   <item>阿里云 <b>0.19 MB/s</b>（三轮 0.23 / 0.27 / 0.19 —— 稳定地慢）</item>
+    ///   <item>清华 TUNA <b>6.84 MB/s</b> · 中科大 USTC 6.01 MB/s · 腾讯云 1.19 MB/s</item>
+    /// </list>
+    /// <para>差 <b>36 倍</b>：600 MB 的依赖从「约 45 分钟」变成「约 90 秒」。
+    /// 症状极难辨认 —— <b>日志窗口一个字都不动</b>（扩展的 <c>install.py</c> 用的是
+    /// <c>pip install -q</c>，全程静默），看着像卡死，其实在龟速下载；
+    /// 而下载发生在 webui 起来之前，所以<b>服务端口不监听、进度条一直转圈</b>。
+    /// <b>教训：测镜像要测吞吐，别只测解析。</b></para>
     /// </summary>
     internal static class DownloadSource
     {
-        /// <summary>国内加速（默认）—— 阿里云 PyPI + 上海交大 PyTorch</summary>
+        /// <summary>国内加速（默认）—— 清华 TUNA PyPI + 上海交大 PyTorch</summary>
         public const string Cn = "cn";
 
         /// <summary>官方源 —— pypi.org + download.pytorch.org，与 Forge 原生行为一致</summary>
@@ -52,7 +75,7 @@ namespace ForgeNeoLauncher
         /// <summary>下拉框里显示的第二行说明</summary>
         public static string Detail(string? v) => IsOfficial(v)
             ? "pypi.org + download.pytorch.org —— 与 Forge 原生行为一致；镜像站故障时切到这里"
-            : "阿里云 PyPI + 上海交大 PyTorch 镜像 —— 国内实测更快，默认选它";
+            : "清华 TUNA PyPI + 上海交大 PyTorch 镜像 —— 实测吞吐最快，默认选它";
 
         /// <summary>下拉框数据源（界面只是这份清单的投影）</summary>
         public static List<SourceOption> Options() => new List<SourceOption>
@@ -61,10 +84,10 @@ namespace ForgeNeoLauncher
             new SourceOption { Id = Official, Title = Title(Official),  Detail = Detail(Official) }
         };
 
-        /// <summary>普通 PyPI 包的索引地址</summary>
+        /// <summary>普通 PyPI 包的索引地址（默认清华 TUNA，见类注释里的吞吐实测）</summary>
         public static string PyPiIndex(string? v) => IsOfficial(v)
             ? "https://pypi.org/simple/"
-            : "https://mirrors.aliyun.com/pypi/simple/";
+            : "https://pypi.tuna.tsinghua.edu.cn/simple/";
 
         /// <summary>PyTorch wheel 索引地址。<paramref name="branch"/> 形如 cu130。</summary>
         public static string TorchIndex(string? v, string branch)
