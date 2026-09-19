@@ -539,6 +539,13 @@ namespace ForgeNeoLauncher
             // 装依赖那段最容易被误判成「卡死」（扩展的 install.py 原本带 -q，全程静默）。
             // 这里先把「去哪儿看」说清楚：实时看本窗口，事后翻这个文件。
             AddLog($"依赖安装的完整日志会写在：{AppPaths.PipLogFile}", InfoBrush);
+
+            // 扩展补丁必须赶在拉起 Forge **之前**：Forge 一起手就会跑各扩展的 install.py，
+            // 那时再去改 requirements 已经晚了。绝大多数启动里文件本来就是对的，
+            // 这里连一次写盘都不会发生（幂等）。详见 ExtensionPatches.cs。
+            ExtensionPatches.ApplyAll(AppPaths.Root,
+                (msg, isWarn) => AddLog(msg, isWarn ? WarnBrush : InfoBrush));
+
             try
             {
                 var psi = new ProcessStartInfo
