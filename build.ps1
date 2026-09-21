@@ -1,6 +1,6 @@
 ﻿<#
   Forge Neo 启动器 —— 构建脚本
-  产出：_published\ForgeNeoLauncher.exe（自包含单文件，约 70 MB）
+  产出：_published\ForgeNeoLauncher.exe（自包含单文件，约 73 MB）
 
   自包含 = 连 .NET 8 桌面运行时一并打进 exe，目标机器不用预装任何东西。
   WPF 不支持裁剪（PublishTrimmed 会破坏 XAML 反射），体积靠单文件压缩来控制。

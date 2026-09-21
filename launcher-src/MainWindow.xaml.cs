@@ -23,8 +23,20 @@ namespace ForgeNeoLauncher
         // 路径一律由 AppPaths 解析，不再写死盘符 —— 整合包要能换目录运行
         private static string NeoToolDir => AppPaths.Root;
         private static string PythonPath => AppPaths.PythonExe;
-        private static readonly string WebUiUrl = "http://127.0.0.1:7860";
-        private static readonly int Port = 7860;
+
+        /// <summary>
+        /// 本次运行<b>实际</b>使用的服务端口。
+        ///
+        /// <para>⚠ 它<b>不是常量</b>：目标端口被别的程序占用时会改用其他端口
+        /// （见 <see cref="PortGuard"/>）。原先这里写死 7860，后果是"端口上那个 PID"
+        /// 从头到尾都可能是<b>别人</b>的 —— 状态栏显示别人的 PID、【打开界面】打开别人的
+        /// 页面、【终止进程】更是直接杀掉别人的程序。修法不是"把 7860 挪个位置"，
+        /// 而是<b>先分清端口上坐的到底是谁</b>。</para>
+        /// </summary>
+        private int currentPort = PortGuard.DefaultPort;
+
+        /// <summary>服务地址。跟着 <see cref="currentPort"/> 走，<b>绝不写死</b>。</summary>
+        private string WebUiUrl => $"http://127.0.0.1:{currentPort}";
 
         // ---- 基础启动参数（固定不变的骨架）----
         // 可变部分来自「高级选项」页，见 AdvancedOptions.AppendTo
@@ -157,6 +169,13 @@ namespace ForgeNeoLauncher
         // ⚠ 不要拿 autoOpened 兼职这件事：用户关掉「就绪后自动打开界面」时它恒为 false，
         //   于是每次正常退出都会被判成"启动失败"。
         private bool portEverUp;
+
+        // ---- 空闲时端口占用者的缓存 ----
+        // 监控线程每秒跑一次，而 Describe() 要读进程路径（两次进程查询）。
+        // 只在"端口换人了"时才重算，别每秒刷同一条状态。
+        private int idlePid = -1;
+        private string idleOwnerDesc = "";
+        private bool idleOwnerIsOurs;
         private bool autoOpened;              // 就绪这一刻已处理过（含"用户主动关闭自动打开"的情况）
         private bool childExitNoted;          // 子进程退出只收尾一次（监控循环每秒都会看到"没在跑"）
         private CancellationTokenSource? monitorCts;
@@ -179,12 +198,22 @@ namespace ForgeNeoLauncher
         private bool isDark = false;
         // 当前高亮的菜单按钮（切主题时重挂高亮，不跳回第一个）
         private System.Windows.Controls.Button? activeMenuBtn;
-        // 版本管理：是否正在检测/更新（防重复点击）
+        // 版本管理 / 插件管理：是否正在检测/更新（防重复点击）。
+        // ⚠ **一个锁、两页共用** —— 内核与插件虽然分了两页，但更新动作都动同一份磁盘，
+        //    两把锁就会出现"内核正在写文件、插件更新同时也开跑"。
         private bool versionBusy = false;
-        // 版本管理：内核检测结果
-        private UpdateItem? coreItem;
-        // 版本管理：是否已检测过至少一次（决定显示引导卡片还是结果区）
-        private bool versionCheckedOnce = false;
+        // 版本管理：内核检测结果（内核与插件是**两个独立模型**，不再共用一个带 IsCore 的类）
+        private CoreUpdateInfo? coreItem;
+        // 插件管理：上一次扫描到的插件全集。搜索只改**显示**，不动这一份
+        private List<ExtensionInfo> extItems = new List<ExtensionInfo>();
+        // 插件管理：搜索关键字（空 = 全显示）
+        private string extFilter = "";
+        // 版本管理：内核是否已检测过至少一次（决定显示引导卡片还是内核卡片）
+        // ⚠ 只管内核。v0.31 及以前它同时管着插件区的显隐，于是"进插件页看看有哪些插件"
+        //   都要先点一次检测（要发网络请求）。拆页之后插件区是常显的，各自管各自的。
+        private bool coreCheckedOnce = false;
+        // 插件管理：是否已扫过一次本地目录（决定进页面时要不要自动扫一遍）
+        private bool extScannedOnce = false;
 
         // PyTorch 环境：是否已探测过（本地命令，不发网络）
         private bool torchProbedOnce = false;
@@ -347,7 +376,9 @@ namespace ForgeNeoLauncher
             ApplyMaxCompensation();
 
             // 版本管理：指向 Forge Neo 安装目录
-            Updater.RepoDir = NeoToolDir;
+            // 内核与插件各自拿自己的根目录（拆成两个模块后，谁也不该去读别人的静态字段）
+            CoreUpdater.Root = NeoToolDir;
+            ExtensionManager.Root = NeoToolDir;
 
             // 显示启动器版本号
             LogoVersionText.Text = AppInfo.Short;
@@ -376,20 +407,33 @@ namespace ForgeNeoLauncher
             AddLog("在【首页】点【一键启动】运行。关闭窗口时可选择是否停止后台服务。", InfoBrush);
 
             // 初始接管运行中的实例
-            int initPid = GetPortPid();
-            if (initPid > 0)
+            //
+            // ⚠ 判据是「端口上坐的是不是**本包**的 Forge」，不是「端口上有没有人」。
+            //   后者会把别人的 PID 当自己的接管过来 —— 界面显示成"运行中"、
+            //   点【终止进程】还会把对方杀掉。分清归属的理由详见 PortGuard。
+            if (advOpts.TryPortArg(out var initPort)) currentPort = initPort;
+            var initProbe = PortGuard.Inspect(currentPort, new[] { ReadPid() }, NeoToolDir);
+            if (initProbe.IsOurs)
             {
-                AddLog($"检测到服务已在运行 (PID: {initPid})，已自动进入监控模式。", InfoBrush);
-                UpdateStatus("运行中", $"PID {initPid} · {WebUiUrl}");
+                AddLog($"检测到 Forge Neo 已在运行 (PID: {initProbe.Pid})，已自动进入监控模式。", InfoBrush);
+                UpdateStatus("运行中", $"PID {initProbe.Pid} · {WebUiUrl}");
                 OpenBtn.IsEnabled = true;
                 StartBtn.IsEnabled = false;
                 StopBtn.IsEnabled = true;
-                WritePid(initPid);
+                WritePid(initProbe.Pid);
 
                 // 服务是**之前**就起来的，不是这次点出来的：别再替他弹一次浏览器。
                 // 少了这两行，重开启动器（或它自己重启）就会平白多一个 127.0.0.1:7860 标签页。
                 portEverUp = true;
                 autoOpened = true;
+            }
+            else if (!initProbe.Free)
+            {
+                // 端口有人占着，但不是本包的 Forge。现在就把话说清楚，
+                // 免得到时候用户看见"明明起了却打不开这个地址"一头雾水。
+                AddLog($"提示：端口 {currentPort} 已被其他程序占用：{initProbe.OwnerDesc}", WarnBrush);
+                AddLog("它**不是**本启动器启动的 Forge。点【一键启动】时会按【服务与网络】里的设置"
+                     + "自动改用其他空闲端口，绝不会去结束那个进程。", WarnBrush);
             }
 
             StartMonitor();
@@ -464,8 +508,10 @@ namespace ForgeNeoLauncher
         /// </summary>
         private void AutoRouteByDeployStatus()
         {
-            // 服务已在运行 = 环境本来就是好的。这时把人拽到部署页纯属添乱
-            if (GetPortPid() > 0)
+            // 服务已在运行 = 环境本来就是好的。这时把人拽到部署页纯属添乱。
+            // ⚠ 用 IsOurForgeRunning() 而不是"端口上有人"：别人占着 7860 时，
+            //   后者会让本该显示"包不完整、要重解压"的严重问题被白白跳过。
+            if (IsOurForgeRunning())
             {
                 RefreshDeployDot();
                 return;
@@ -499,18 +545,7 @@ namespace ForgeNeoLauncher
         // ================= 一键启动 =================
         private async void Start_Click(object sender, RoutedEventArgs e)
         {
-            int existingPid = GetPortPid();
-            if (existingPid > 0 && (proc == null || proc.HasExited))
-            {
-                AddLog($"检测到 {NeoToolDir} 已在运行 (PID: {existingPid})，进入监控模式。", SuccessBrush);
-                UpdateStatus("运行中", $"PID {existingPid} · {WebUiUrl}");
-                OpenBtn.IsEnabled = true;
-                StartBtn.IsEnabled = false;
-                StopBtn.IsEnabled = true;
-                WritePid(existingPid);
-                return;
-            }
-
+            // ① 自己起的进程还活着 —— 已经在跑了
             if (proc != null && !proc.HasExited)
             {
                 AddLog("服务已在运行中，无需重复启动。", WarnBrush);
@@ -524,6 +559,69 @@ namespace ForgeNeoLauncher
                 AddLog("请把启动器放进 Forge Neo 目录（与 launch.py 同级），或用环境变量 FORGE_NEO_ROOT 指定位置。", WarnBrush);
                 return;
             }
+
+            // ② 端口决策 —— 先弄清目标端口上坐着谁，再决定「接管 / 直接用 / 换一个」
+            //
+            // ⚠ 刻意排在 python 检查**之前**：端口没得用就该立刻失败，
+            //   而不是让用户等完几十分钟的首次部署才被告知端口冲突。
+            //
+            // ⚠ 也刻意不把"端口有人在听"当成"服务已在运行"：那可能是**任何**程序。
+            //   分辨归属的完整理由见 PortGuard。
+            if (!advOpts.TryPortArg(out int wantPort))
+            {
+                AddLog($"服务端口「{advOpts.Port}」无效，无法启动。", ErrorBrush);
+                AddLog($"请到【高级选项】→【服务与网络】填 1~65535 之间的整数（默认 {PortGuard.DefaultPort}）。", WarnBrush);
+                return;
+            }
+
+            var probe = PortGuard.Inspect(wantPort, new[] { ReadPid() }, NeoToolDir);
+
+            if (probe.IsOurs)
+            {
+                // 端口上是**本包**的 Forge（上次没退干净 / 用户自己用 webui.bat 起的）
+                // —— 服务其实已经在跑，接管监控即可，别再开一个实例
+                AddLog($"检测到 Forge Neo 已在运行 (PID: {probe.Pid})，进入监控模式。", SuccessBrush);
+                currentPort = wantPort;
+                advOpts.EffectivePort = currentPort;
+                UpdateStatus("运行中", $"PID {probe.Pid} · {WebUiUrl}");
+                OpenBtn.IsEnabled = true;
+                StartBtn.IsEnabled = false;
+                StopBtn.IsEnabled = true;
+                WritePid(probe.Pid);
+                RefreshPreview();
+                return;
+            }
+
+            if (probe.Free)
+            {
+                currentPort = wantPort;
+            }
+            else if (!advOpts.AutoSwitchPort)
+            {
+                // 关掉了自动切换：**只报错，绝不去动那个进程**
+                AddLog($"端口 {wantPort} 已被其他程序占用：{probe.OwnerDesc}", ErrorBrush);
+                AddLog("该程序不是本启动器启动的 Forge —— 启动器不会去结束它，本次启动已取消。", WarnBrush);
+                AddLog("请二选一：① 到【高级选项】→【服务与网络】换一个端口；"
+                     + "② 打开「端口被占用时自动改用其他端口」。", WarnBrush);
+                return;
+            }
+            else
+            {
+                int alt = PortGuard.FindFreePort(wantPort + 1, PortGuard.ScanCount);
+                if (alt <= 0)
+                {
+                    AddLog($"端口 {wantPort} 已被其他程序占用：{probe.OwnerDesc}", ErrorBrush);
+                    AddLog($"其后 {PortGuard.ScanCount} 个端口也都不可用，没有可换的端口。"
+                         + "请到【高级选项】→【服务与网络】手动指定一个。", WarnBrush);
+                    return;
+                }
+                AddLog($"端口 {wantPort} 已被其他程序占用：{probe.OwnerDesc}", WarnBrush);
+                AddLog($"它**不是**本启动器启动的 Forge（启动器不会去结束它），本次自动改用端口 {alt}。", WarnBrush);
+                currentPort = alt;
+            }
+
+            advOpts.EffectivePort = currentPort;
+            RefreshPreview();
 
             if (!File.Exists(PythonPath))
             {
@@ -541,7 +639,7 @@ namespace ForgeNeoLauncher
                 }
             }
 
-            AddLog($"正在启动 Forge Neo ...", InfoBrush);
+            AddLog($"正在启动 Forge Neo（端口 {currentPort}）...", InfoBrush);
             // 装依赖那段最容易被误判成「卡死」（扩展的 install.py 原本带 -q，全程静默）。
             // 这里先把「去哪儿看」说清楚：实时看本窗口，事后翻这个文件。
             AddLog($"依赖安装的完整日志会写在：{AppPaths.PipLogFile}", InfoBrush);
@@ -593,6 +691,7 @@ namespace ForgeNeoLauncher
             childExitNoted = false;
             portEverUp = false;
             autoOpened = false;
+            idlePid = -1;                 // 端口占用者的缓存跟着清零，下次重算
             BeginMainBusy("正在启动 Forge");
 
             StartBtn.IsEnabled = false;
@@ -717,6 +816,12 @@ namespace ForgeNeoLauncher
 
         private void StopForge(string reason)
         {
+            // ---- 只停「我们自己的」进程 ----
+            //
+            // ⚠ 这里**绝不再按端口杀**。旧代码最后是 `KillTree(GetPortPid())`，
+            //   而端口上那一位完全可能是**别人的程序** —— gradio 在没拿到 --port 时会
+            //   自己往上找端口，于是我们的 Forge 在 7861，而 7860 上坐着的是别人。
+            //   那一刀就是误杀无关进程。理由详见 PortGuard。
             if (proc != null && !proc.HasExited)
             {
                 AddLog($"正在停止服务 ({reason}) ...", WarnBrush);
@@ -733,16 +838,43 @@ namespace ForgeNeoLauncher
                     AddLog($"停止过程出错：{ex.Message}", ErrorBrush);
                 }
             }
+            else
+            {
+                // 监控模式：进程不是我们起的，靠 forge.pid 认领。
+                // 同样要过身份判据 —— PID 会被系统复用，只看号码有可能杀错人。
+                int adopted = ReadPid();
+                if (adopted > 0 && PortGuard.IsAlive(adopted) && PortGuard.LooksLikeOurForge(adopted, NeoToolDir))
+                {
+                    AddLog($"正在停止服务 (PID {adopted}，{reason}) ...", WarnBrush);
+                    KillTree(adopted);
+                }
+                else if (adopted > 0)
+                {
+                    AddLog($"forge.pid 里记的进程 {adopted} 已不在运行、或不是本包的 Forge，跳过。", InfoBrush);
+                }
+            }
 
             Thread.Sleep(600);
-            int portPid = GetPortPid();
+
+            // 端口还占着的话**只报告，不动手**。
+            // 坐在那儿的可能是别人的程序，杀它就是误杀；真正需要清理时用户自己会处理。
+            int portPid = PortGuard.GetPortPid(currentPort);
             if (portPid > 0)
             {
-                AddLog($"端口 {Port} 仍被进程 {portPid} 占用，正在清理...", WarnBrush);
-                KillTree(portPid);
+                var left = PortGuard.Classify(portPid, new[] { proc?.Id ?? -1, ReadPid() }, NeoToolDir);
+                if (left.IsOurs)
+                    AddLog($"端口 {currentPort} 仍被本包的 Forge (PID {portPid}) 占用，可再点一次【终止进程】。", WarnBrush);
+                else
+                    AddLog($"端口 {currentPort} 仍被 {left.OwnerDesc} 占用 —— 那不是本包的 Forge，启动器不会去结束它。", WarnBrush);
             }
 
             try { File.Delete(Path.Combine(NeoToolDir, "forge.pid")); } catch { }
+
+            // 本次运行用的端口回到配置值。预览也跟着回到"下次启动会用到的参数"，
+            // 否则界面会一直显示上次自动切换后的端口，让用户以为配置被改了。
+            advOpts.EffectivePort = null;
+            idlePid = -1;
+            RefreshPreview();
 
             UpdateStatus("已停止", "");
             AddLog("服务已停止。", SuccessBrush);
@@ -777,7 +909,14 @@ namespace ForgeNeoLauncher
                 header.AppendLine($"Forge 目录 : {NeoToolDir}");
                 header.AppendLine($"Python     : {PythonPath}");
                 header.AppendLine($"服务地址   : {WebUiUrl}");
-                header.AppendLine($"端口       : {Port}");
+                header.AppendLine($"端口       : {currentPort}"
+                    + (advOpts.EffectivePort.HasValue && advOpts.TryPortArg(out var cfgP) && cfgP != currentPort
+                        ? $"（配置为 {cfgP}，本次自动切换）" : ""));
+                // 端口上坐的是谁 —— 自动换端口、打开界面、停止服务全看它，排障第一眼要看的
+                var dProbe = PortGuard.Inspect(currentPort, new[] { proc?.Id ?? -1, ReadPid() }, NeoToolDir);
+                header.AppendLine($"端口占用   : {(dProbe.Free
+                    ? "空闲"
+                    : dProbe.OwnerDesc + (dProbe.IsOurs ? "（本包 Forge）" : "（不是本包的 Forge）"))}");
                 // 排查「localhost is not accessible」时第一眼要看的东西
                 header.AppendLine($"代理绕过   : {ProxyEnv.MergeNoProxy(Environment.GetEnvironmentVariable("NO_PROXY"))}");
                 header.AppendLine($"当前状态   : {StateText.Text} {StateDetail.Text}");
@@ -801,10 +940,14 @@ namespace ForgeNeoLauncher
                 SetMenuActive(btn);
                 string tag = (btn.Tag as string) ?? "";
 
-                // 各页 → 各自的视图；「控制台」与其余占位项 → 日志视图
+                // 各页 → 各自的视图；「控制台」「疑难解答」「模型管理」→ 日志视图
                 if (tag == "版本管理")
                 {
                     ShowVersionView();
+                }
+                else if (tag == "插件管理")
+                {
+                    ShowExtView();
                 }
                 else if (tag == "高级选项")
                 {
@@ -823,6 +966,11 @@ namespace ForgeNeoLauncher
                     ShowMainView();
                 }
 
+                // ⚠ 删侧栏菜单项时，**这个 switch 里的分支要一起删**：只删分支不删按钮，
+                //   按钮照样点得动、只是悄悄走上面的 else → 切到控制台（看着"有功能"、其实
+                //   什么也没干）；反过来只删按钮、留下死分支更该删 —— 它会让下一个人以为这里
+                //   还有功能。v0.33 删掉的「交流群」「设置」就是这种从没接上页面的占位项：
+                //   第 27 节 + 反例 55/56 同时盯着 XAML 与这里。
                 switch (tag)
                 {
                     case "一键部署":
@@ -835,14 +983,13 @@ namespace ForgeNeoLauncher
                         break;
                     case "高级选项": AddLog("已打开【高级选项】。切换后点【保存并应用】，下次启动生效（当前运行中的实例不受影响）。", InfoBrush); break;
                     case "疑难解答": AddLog("[提示] 若启动异常，点击顶部【生成诊断包】导出日志。", InfoBrush); break;
-                    case "版本管理": AddLog("已打开【版本管理】。点击右上角【检测更新】查看内核与插件更新。", InfoBrush); break;
+                    case "版本管理": AddLog("已打开【版本管理】。点右上角【检测内核更新】查看 Forge Neo 内核是否有新版本；插件请去【插件管理】。", InfoBrush); break;
+                    case "插件管理": AddLog("已打开【插件管理】。可以在这里安装 / 启用禁用 / 卸载 / 更新插件。", InfoBrush); break;
                     case "模型管理":
                         AddLog(advOpts.UseA1111Home && !string.IsNullOrWhiteSpace(advOpts.A1111Home)
                             ? $"模型目录：复用已有 A1111 安装 {advOpts.A1111Home}"
                             : $"模型目录：{AppPaths.ModelsDir}（可在【高级选项 → 模型目录】里追加其他目录）", InfoBrush);
                         break;
-                    case "交流群": AddLog("[占位] 社区交流通道，此处暂未配置。", InfoBrush); break;
-                    case "设置": AddLog("[占位] 请在 WebUI 的 Settings 页配置本地化、主题等选项。", InfoBrush); break;
                 }
             }
         }
@@ -856,11 +1003,12 @@ namespace ForgeNeoLauncher
         /// </summary>
         private void ShowView(string view)
         {
-            HomeView.Visibility     = view == ViewHome     ? Visibility.Visible : Visibility.Collapsed;
-            MainView.Visibility     = view == ViewMain     ? Visibility.Visible : Visibility.Collapsed;
-            DeployView.Visibility   = view == ViewDeploy   ? Visibility.Visible : Visibility.Collapsed;
-            VersionView.Visibility  = view == ViewVersion  ? Visibility.Visible : Visibility.Collapsed;
-            AdvancedView.Visibility = view == ViewAdvanced ? Visibility.Visible : Visibility.Collapsed;
+            HomeView.Visibility      = view == ViewHome      ? Visibility.Visible : Visibility.Collapsed;
+            MainView.Visibility      = view == ViewMain      ? Visibility.Visible : Visibility.Collapsed;
+            DeployView.Visibility    = view == ViewDeploy    ? Visibility.Visible : Visibility.Collapsed;
+            VersionView.Visibility   = view == ViewVersion   ? Visibility.Visible : Visibility.Collapsed;
+            ExtensionView.Visibility = view == ViewExt       ? Visibility.Visible : Visibility.Collapsed;
+            AdvancedView.Visibility  = view == ViewAdvanced  ? Visibility.Visible : Visibility.Collapsed;
 
             // 顶栏**整条**在首页收起，把顶部那 64px 全让给题图
             // （Grid.Row 0 已改成 Auto，收起后不会留空白）。
@@ -898,15 +1046,24 @@ namespace ForgeNeoLauncher
                 // 用户只是想进来看看时不该替他跑一遍。这里只读一次 PyTorch 环境（纯本地 import）。
                 _ = ProbeTorchEnvAsync();
             }
+            else if (view == ViewExt && !extScannedOnce)
+            {
+                // 插件页进来先扫一遍**本地**目录（每个扩展几条 git 进程，**不发网络请求**）——
+                // 否则列表是空的，而用户进这一页本来就是为了看有哪些插件。
+                // 要问"有没有新版本"是「检测插件更新」那个按钮的事。
+                _ = RescanExtensionsAsync();
+            }
         }
 
-        private const string ViewHome     = "home";
-        private const string ViewMain     = "main";
-        private const string ViewDeploy   = "deploy";
-        private const string ViewVersion  = "version";
-        private const string ViewAdvanced = "advanced";
+        private const string ViewHome      = "home";
+        private const string ViewMain      = "main";
+        private const string ViewDeploy    = "deploy";
+        private const string ViewVersion   = "version";
+        private const string ViewExt       = "ext";
+        private const string ViewAdvanced  = "advanced";
 
         private void ShowVersionView()  => ShowView(ViewVersion);
+        private void ShowExtView()      => ShowView(ViewExt);
         private void ShowAdvancedView() => ShowView(ViewAdvanced);
         private void ShowMainView()     => ShowView(ViewMain);
 
@@ -1626,7 +1783,10 @@ namespace ForgeNeoLauncher
             activeMenuBtn = active;
             var activeBg = MenuActiveBg;
             var idleFore = (Brush)FindResource("MenuIdleFore");
-            var buttons = new[] { MenuHome, MenuConsole, MenuDeploy, MenuAdvanced, MenuFix, MenuVersion, MenuModel, MenuGroup, MenuSetting };
+            var buttons = new[] { MenuHome, MenuConsole, MenuDeploy, MenuAdvanced, MenuFix, MenuVersion, MenuExt, MenuModel };
+            // ⚠ 这里引用的控件必须真实存在（编译期就挡得住），但**漏一个**是静默的：
+            //   漏掉的按钮不会被重置成 idle 色，切主题后会留着上一套主题的灰。
+            //   `_hometest` 的「切主题后菜单文字跟着换色」那条断言用的就是同一份清单。
             foreach (var b in buttons)
             {
                 if (b == null) continue;
@@ -1678,54 +1838,42 @@ namespace ForgeNeoLauncher
             ThemeLabel.Text = dark ? "黑夜" : "白天";
         }
 
-        // ================= 版本管理 =================
+        // ================= 版本管理（内核）=================
+        //  ⚠ v0.32 起这一页只管**内核**。插件那一整套（扫描 / 检测 / 装 / 卸 / 启停 / 更新）
+        //    搬到了【插件管理】页 —— 于是"检测"与"一键更新全部"在每一页上都只有一个意思。
         private void CheckUpdate_Click(object sender, RoutedEventArgs e)
         {
-            _ = CheckUpdatesAsync();
+            _ = CheckCoreAsync();
         }
 
-        private async Task CheckUpdatesAsync()
+        private async Task CheckCoreAsync()
         {
             if (versionBusy) return;
             versionBusy = true;
             CheckUpdateBtn.IsEnabled = false;
-            UpdateAllBtn.IsEnabled = false;
-            VerStatusText.Text = "正在检测 ...";
+            VerStatusText.Text = "正在检测内核 ...";
 
             try
             {
-                // 内核 + 插件并行检测（都放到线程池，避免 git 同步调用卡住 UI）
-                var coreTask = Task.Run(() => Updater.CheckCoreAsync());
-                var extTask = Task.Run(() => Updater.CheckExtensionsAsync(msg =>
-                {
-                    Dispatcher.Invoke(() => VerStatusText.Text = msg);
-                }));
-
-                coreItem = await coreTask;
-                var exts = await extTask;
-                var ci = coreItem;   // 局部非空引用
+                // git 与 HTTP 都是同步等待，放线程池里跑，别卡 UI
+                var ci = await Task.Run(() => CoreUpdater.CheckAsync());
+                coreItem = ci;
 
                 Dispatcher.Invoke(() =>
                 {
                     FillCore(ci);
-                    ExtList.ItemsSource = exts;
-                    int upd = (ci.State == UpdateState.UpdateAvailable ? 1 : 0)
-                              + exts.Count(x => x.State == UpdateState.UpdateAvailable);
-                    ExtCountText.Text = $"共 {exts.Count} 个插件" + (upd > 0 ? $" · {upd} 项可更新" : "");
-                    UpdateAllBtn.IsEnabled = upd > 0;
-                    VerStatusText.Text = $"检测完成（{DateTime.Now:HH:mm:ss}）"
-                                         + (upd > 0 ? $" · 有 {upd} 项可更新" : " · 全部已是最新");
 
-                    // 首次检测完成 → 收起引导卡片，露出结果
-                    versionCheckedOnce = true;
+                    // 首次检测完成 → 收起引导卡片，露出内核卡片
+                    coreCheckedOnce = true;
                     ShowUpdateResult();
-                    AddLog($"版本检测完成：内核 {StateTextOf(ci)}，插件 {exts.Count} 个。", InfoBrush);
+                    VerStatusText.Text = $"检测完成（{DateTime.Now:HH:mm:ss}）· {StateTextOf(ci.State)}";
+                    AddLog($"内核检测完成：{StateTextOf(ci.State)}。", InfoBrush);
                 });
             }
             catch (Exception ex)
             {
                 Dispatcher.Invoke(() => VerStatusText.Text = "检测失败：" + ex.Message);
-                AddLog("版本检测失败：" + ex.Message, ErrorBrush);
+                AddLog("内核检测失败：" + ex.Message, ErrorBrush);
             }
             finally
             {
@@ -1736,6 +1884,24 @@ namespace ForgeNeoLauncher
                     CoreUpdateBtn.IsEnabled = coreItem?.CanUpdate == true;
                 });
             }
+        }
+
+        /// <summary>
+        /// 把 <see cref="extItems"/> 按当前搜索词过滤后送进列表。
+        ///
+        /// <para>列表显示的是<b>过滤后的子集</b>，而「一键更新」读的是
+        /// <see cref="extItems"/> 全集 —— 免得用户搜了两个字之后，
+        /// 「更新全部」就只更新了看得见的那几个。</para>
+        /// </summary>
+        private void ApplyExtFilter()
+        {
+            var shown = ExtensionManager.Filter(extItems, extFilter);
+            ExtList.ItemsSource = shown;
+
+            int upd = extItems.Count(x => x.State == UpdateState.UpdateAvailable);
+            ExtCountText.Text = $"共 {extItems.Count} 个插件"
+                                + (shown.Count != extItems.Count ? $"，显示 {shown.Count} 个" : "")
+                                + (upd > 0 ? $" · {upd} 项可更新" : "");
         }
 
         // ================= 版本管理：选项卡 =================
@@ -1756,24 +1922,28 @@ namespace ForgeNeoLauncher
             PaneUpdate.Visibility = showUpdate ? Visibility.Visible : Visibility.Collapsed;
             PaneTorch.Visibility = showTorch ? Visibility.Visible : Visibility.Collapsed;
 
-            // 两个面板的右上角按钮用途不同，跟着切
+            // 「检测内核更新」只属于内核那个面板。
+            // （以前还要跟着切「一键更新全部」—— 那个按钮已随插件区搬到【插件管理】页，
+            //   它不属于这一页的任何 tab，在这里管它只会把它错关掉。）
             CheckUpdateBtn.Visibility = showUpdate ? Visibility.Visible : Visibility.Collapsed;
-            UpdateAllBtn.Visibility = showUpdate ? Visibility.Visible : Visibility.Collapsed;
 
             if (showTorch && !torchProbedOnce) _ = ProbeTorchEnvAsync();
         }
 
-        /// <summary>引导卡片 ⇄ 检测结果 的显隐</summary>
+        /// <summary>
+        /// 版本管理页：引导卡片 ⇄ 内核卡片 的显隐。
+        ///
+        /// <para>⚠ <b>只管内核</b>。v0.31 及以前它还管着插件区（ExtHeader / ExtToolRow /
+        /// ExtCard）的显隐 —— 那套"没检测过就别看列表"的闸门，在插件独立成页之后
+        /// 已经没有意义了：进【插件管理】就是要看有哪些插件。</para>
+        /// </summary>
         private void ShowUpdateResult()
         {
-            var vis = versionCheckedOnce ? Visibility.Visible : Visibility.Collapsed;
-            CoreCard.Visibility = vis;
-            ExtHeader.Visibility = vis;
-            ExtCard.Visibility = vis;
-            VerIdleHint.Visibility = versionCheckedOnce ? Visibility.Collapsed : Visibility.Visible;
+            CoreCard.Visibility = coreCheckedOnce ? Visibility.Visible : Visibility.Collapsed;
+            VerIdleHint.Visibility = coreCheckedOnce ? Visibility.Collapsed : Visibility.Visible;
         }
 
-        private static string StateTextOf(UpdateItem it) => it.State switch
+        private static string StateTextOf(UpdateState st) => st switch
         {
             UpdateState.UpToDate => "已是最新",
             UpdateState.UpdateAvailable => "可更新",
@@ -1781,14 +1951,16 @@ namespace ForgeNeoLauncher
             _ => "未知"
         };
 
-        private void FillCore(UpdateItem it)
+        private void FillCore(CoreUpdateInfo it)
         {
             CoreRemoteText.Text = "远程地址：" + (string.IsNullOrEmpty(it.RemoteUrl) ? "—" : it.RemoteUrl);
             CoreCurrentText.Text = "当前版本：" + (string.IsNullOrEmpty(it.CurrentVersion) ? "未知" : it.CurrentVersion);
             CoreLatestText.Text = "  最新版本：" + (string.IsNullOrEmpty(it.LatestVersion) ? "—" : it.LatestVersion);
 
+            // 这里是内核卡片 —— 传进来的必定是内核信息，不必再问一次「是不是内核」
+            // （那个 IsCore 判断正是拆模型要去掉的东西）
             string msg = it.Message;
-            if (it.IsCore && !string.IsNullOrEmpty(it.LatestMessage))
+            if (!string.IsNullOrEmpty(it.LatestMessage))
                 msg += "  ·  " + it.LatestMessage;
             CoreMsgText.Text = msg;
 
@@ -1822,7 +1994,9 @@ namespace ForgeNeoLauncher
             if (versionBusy || coreItem == null) return;
 
             // 前置检查：服务运行中时文件被占用，更新可能失败
-            bool svcRunning = (proc != null && !proc.HasExited) || GetPortPid() > 0;
+            // ⚠ 只看"我们自己的进程"，**不看端口** —— 端口上那一位可能是别人的程序，
+            //   认成自己就会在下面的「是否先停止服务」里把对方杀掉。
+            bool svcRunning = IsOurForgeRunning();
             if (svcRunning)
             {
                 var r0 = MessageBox.Show(
@@ -1852,14 +2026,15 @@ namespace ForgeNeoLauncher
 
             versionBusy = true;
             CoreUpdateBtn.IsEnabled = false;
-            UpdateAllBtn.IsEnabled = false;
             CheckUpdateBtn.IsEnabled = false;
             VerStatusText.Text = "正在更新内核 ...";
             AddLog("开始更新 Forge Neo 内核 ...", WarnBrush);
 
+            bool updated = false;
             try
             {
-                var (ok, msg) = await Updater.UpdateCoreAsync();
+                var (ok, msg) = await CoreUpdater.UpdateAsync();
+                updated = ok;
                 AddLog((ok ? "内核更新完成：" : "内核更新失败：") + msg, ok ? SuccessBrush : ErrorBrush);
                 Dispatcher.Invoke(() => VerStatusText.Text = (ok ? "内核已更新：" : "内核更新失败：") + msg);
             }
@@ -1870,35 +2045,359 @@ namespace ForgeNeoLauncher
             finally
             {
                 versionBusy = false;
-                Dispatcher.Invoke(() => CheckUpdateBtn.IsEnabled = true);
-                await CheckUpdatesAsync();
+                Dispatcher.Invoke(() =>
+                {
+                    CheckUpdateBtn.IsEnabled = true;
+
+                    // ⚠ 只刷新**内核这一项**，而且是本地只读的（不联网）。
+                    //   老写法是收尾再跑一次完整检测 —— 那要打 GitHub 的 raw 文件 + API
+                    //   + 每个插件一条 git ls-remote，只为了把一行字改成"已是最新"。
+                    //   只在成功时刷新：MarkUpdated 会直接断言"已是最新"。
+                    if (updated && coreItem != null)
+                    {
+                        CoreUpdater.MarkUpdated(coreItem);
+                        FillCore(coreItem);
+                    }
+                });
             }
+        }
+
+        // ================= 插件管理（v0.32 从「版本管理」独立成页）=================
+        //
+        //  ⚠ 这一节里所有"改完刷新"的动作都遵守同一条规矩：
+        //    **只刷新受影响的那一项**（本地只读），不许顺手把全部插件重问一遍远程。
+        //    老写法是收尾调一次「检测插件更新」—— 点一个插件的「更新」，
+        //    会对几十个插件各发一次 git ls-remote，用户等半天只为看一行字变色。
+
+        private void ExtCheck_Click(object sender, RoutedEventArgs e)
+        {
+            _ = CheckExtsAsync();
+        }
+
+        /// <summary>
+        /// 检测插件更新：先本地扫描，再逐个问远程（<c>git ls-remote</c>，只读不改本地仓库）。
+        ///
+        /// <para>这是**唯一**会发网络请求的插件动作。更新/安装完之后的界面刷新都不走它。</para>
+        /// </summary>
+        private async Task CheckExtsAsync()
+        {
+            if (versionBusy) return;
+            versionBusy = true;
+            BtnExtCheck.IsEnabled = false;
+            UpdateAllBtn.IsEnabled = false;
+            ExtStatusText.Text = "正在检测 ...";
+
+            try
+            {
+                // 扫描本身也要起 git 进程（每个扩展几条），几十个扩展时不能放在 UI 线程上做
+                var exts = await Task.Run(async () =>
+                {
+                    var scanned = ExtensionManager.Scan();
+                    Dispatcher.Invoke(() =>
+                    {
+                        extItems = scanned;
+                        extScannedOnce = true;
+                        ApplyExtFilter();
+                        ExtStatusText.Text = $"正在检测 {scanned.Count} 个插件 ...";
+                    });
+                    return await ExtensionManager.CheckAsync(scanned, msg =>
+                    {
+                        Dispatcher.Invoke(() => ExtStatusText.Text = msg);
+                    });
+                });
+
+                Dispatcher.Invoke(() =>
+                {
+                    extItems = exts;
+                    ApplyExtFilter();
+
+                    int upd = exts.Count(x => x.State == UpdateState.UpdateAvailable);
+                    UpdateAllBtn.IsEnabled = upd > 0;
+                    ExtStatusText.Text = $"检测完成（{DateTime.Now:HH:mm:ss}）"
+                                         + (upd > 0 ? $" · 有 {upd} 项可更新" : " · 全部已是最新");
+                    AddLog($"插件检测完成：{exts.Count} 个"
+                           + (upd > 0 ? $"，{upd} 项可更新。" : "，全部已是最新。"), InfoBrush);
+                });
+            }
+            catch (Exception ex)
+            {
+                Dispatcher.Invoke(() => ExtStatusText.Text = "检测失败：" + ex.Message);
+                AddLog("插件检测失败：" + ex.Message, ErrorBrush);
+            }
+            finally
+            {
+                versionBusy = false;
+                Dispatcher.Invoke(() =>
+                {
+                    BtnExtCheck.IsEnabled = true;
+                    UpdateAllBtn.IsEnabled = extItems.Any(x => x.State == UpdateState.UpdateAvailable);
+                });
+            }
+        }
+
+        /// <summary>搜索框：输入即筛（只改显示，不动 extItems 全集）</summary>
+        private void ExtSearch_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            extFilter = ExtSearchBox.Text ?? "";
+            ApplyExtFilter();
+        }
+
+        /// <summary>
+        /// 本地重扫一遍插件目录 —— <b>不发任何网络请求</b>。
+        /// 首次进页面、点「刷新列表」、装完插件（改走 <see cref="AddExtItem"/>）都会用到它。
+        ///
+        /// <para>返回扫到的列表，调用方自己决定要不要报个数（状态栏文案属于界面的事）。</para>
+        /// </summary>
+        private async Task<List<ExtensionInfo>> RescanExtensionsAsync()
+        {
+            var list = await Task.Run(() => ExtensionManager.Scan());
+            Dispatcher.Invoke(() =>
+            {
+                extItems = list;
+                extScannedOnce = true;
+                ApplyExtFilter();
+            });
+            return list;
+        }
+
+        /// <summary>
+        /// 刷新列表：只重扫本地目录，**不做网络检测**（那是「检测插件更新」的事）。
+        /// 扫描每个扩展都要起几条 git 进程，所以放到线程池。
+        /// </summary>
+        private async void ExtRefresh_Click(object sender, RoutedEventArgs e)
+        {
+            if (versionBusy) return;
+            versionBusy = true;
+            BtnExtRefresh.IsEnabled = false;
+            ExtStatusText.Text = "正在刷新插件列表 ...";
+
+            try
+            {
+                var list = await RescanExtensionsAsync();
+                int localOnly = list.Count(x => !x.IsGit);
+                Dispatcher.Invoke(() => ExtStatusText.Text =
+                    $"列表已刷新（{list.Count} 个"
+                    + (localOnly > 0 ? $"，含 {localOnly} 个本地目录" : "")
+                    + "）；点「检测插件更新」查有无新版本");
+                AddLog($"插件列表已刷新：{list.Count} 个。", InfoBrush);
+            }
+            catch (Exception ex)
+            {
+                AddLog("刷新插件列表失败：" + ex.Message, ErrorBrush);
+            }
+            finally
+            {
+                versionBusy = false;
+                Dispatcher.Invoke(() => BtnExtRefresh.IsEnabled = true);
+            }
+        }
+
+        /// <summary>
+        /// 装完之后把<b>这一项</b>加进列表（按目录名归位，跟扫描的顺序一致）。
+        ///
+        /// <para>⚠ 不做全量重扫：那会对每个扩展各起几条 git 进程，只为了多显示一行。
+        /// 但它读的是 <see cref="ExtensionManager.ScanOne"/> —— 与全量扫描<b>同一个
+        /// <c>ReadOne</c></b>，不是另写一份"简化的扫描"，否则刚装上的那一行
+        /// 与刷新之后的它会长得不一样（禁用状态、来源文案都可能不同）。</para>
+        /// </summary>
+        private void AddExtItem(string name)
+        {
+            var one = ExtensionManager.ScanOne(
+                ExtensionManager.ExtensionsDir, ExtensionManager.ConfigJsonPath, name);
+            if (one == null) return;
+
+            extItems.RemoveAll(x => string.Equals(x.Path, one.Path, StringComparison.OrdinalIgnoreCase));
+            extItems.Add(one);
+            extItems.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+            ApplyExtFilter();
+        }
+
+        /// <summary>从仓库地址安装一个新扩展</summary>
+        private async void ExtInstall_Click(object sender, RoutedEventArgs e)
+        {
+            if (versionBusy) return;
+
+            string url = ExtInstallBox.Text ?? "";
+            var (vok, name, reason) = ExtensionManager.ValidateInstallUrl(url);
+            if (!vok)
+            {
+                AddLog("安装地址无效：" + reason, WarnBrush);
+                MessageBox.Show(reason, "地址无效", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            string dest = Path.Combine(ExtensionManager.ExtensionsDir, name);
+            var rs = MessageBox.Show(
+                "将从下面的地址克隆一个新插件：\n\n" +
+                $"{url.Trim()}\n\n" +
+                $"目录名：{name}\n" +
+                $"目标位置：{dest}\n\n" +
+                "装好后需要重启 Forge 才会加载它。是否继续？",
+                "安装插件确认", MessageBoxButton.OKCancel, MessageBoxImage.Question);
+            if (rs != MessageBoxResult.OK) return;
+
+            versionBusy = true;
+            BtnExtInstall.IsEnabled = false;
+            ExtStatusText.Text = $"正在安装：{name} ...";
+            AddLog($"开始安装插件：{url.Trim()}", WarnBrush);
+
+            bool installed = false;
+            try
+            {
+                var (ok, msg) = await ExtensionManager.InstallAsync(url, ExtensionManager.ExtensionsDir);
+                installed = ok;
+                AddLog((ok ? "安装完成：" : "安装失败：") + msg, ok ? SuccessBrush : ErrorBrush);
+                if (ok) ExtInstallBox.Text = "";
+            }
+            catch (Exception ex)
+            {
+                AddLog("安装异常：" + ex.Message, ErrorBrush);
+            }
+            finally
+            {
+                versionBusy = false;
+                Dispatcher.Invoke(() =>
+                {
+                    BtnExtInstall.IsEnabled = true;
+                    // 只把刚装上的这一项加进列表（不是全量重扫）
+                    if (installed) AddExtItem(name);
+                    ExtStatusText.Text = installed
+                        ? $"「{name}」已安装；重启 Forge 后生效"
+                        : $"「{name}」安装失败，详见日志";
+                });
+            }
+        }
+
+        /// <summary>勾选 / 取消勾选 = 启用 / 禁用（两处都写，见 <see cref="ExtensionManager.SetEnabled"/>）</summary>
+        private void ExtToggle_Click(object sender, RoutedEventArgs e)
+        {
+            if (versionBusy) return;
+            if (sender is not System.Windows.Controls.CheckBox chk) return;
+            if (chk.Tag is not ExtensionInfo item) return;
+
+            bool want = chk.IsChecked == true;
+            if (item.Enabled == want) return;      // 与当前一致 —— 什么都不做
+
+            var (ok, msg) = ExtensionManager.SetEnabled(item, want, ExtensionManager.ConfigJsonPath);
+
+            if (ok)
+            {
+                item.Enabled = want;
+                AddLog($"插件「{item.Name}」{(want ? "已启用" : "已禁用")}：{msg}。重启 Forge 后生效。",
+                       SuccessBrush);
+            }
+            else
+            {
+                // 只成功了一半时（例如 disabled 文件写了、config.json 没写），
+                // 磁盘与模型可能不一致 —— 把勾恢复成模型值并让用户去核对，
+                // 而不是留一个"看着对、其实不对"的勾。
+                chk.IsChecked = item.Enabled;
+                AddLog($"插件「{item.Name}」{(want ? "启用" : "禁用")}未完全成功：{msg}"
+                       + "　建议点「刷新列表」核对实际状态。", ErrorBrush);
+            }
+        }
+
+        /// <summary>卸载：只读判断 → 用户确认 → 移入回收站。顺序不能反。</summary>
+        private void ExtUninstall_Click(object sender, RoutedEventArgs e)
+        {
+            if (versionBusy) return;
+            if (sender is not System.Windows.Controls.Button b) return;
+            if (b.Tag is not ExtensionInfo item) return;
+
+            string extDir = ExtensionManager.ExtensionsDir;
+
+            // ⚠ 先做**只读**判断（是不是 extensions 的直接子目录、是不是链接……），
+            //   再问，最后才动手。不可逆的动作排在最后 —— 见 CanUninstall 的注释。
+            var (can, reason) = ExtensionManager.CanUninstall(item, extDir);
+            if (!can)
+            {
+                AddLog($"不能卸载「{item.Name}」：{reason}", ErrorBrush);
+                MessageBox.Show($"不能卸载：{reason}", "无法卸载", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            var rs = MessageBox.Show(
+                $"确定要卸载插件「{item.Name}」吗？\n\n" +
+                $"{item.Path}\n\n" +
+                "• 整个目录会被移入回收站（不是永久删除）—— 误删可以从回收站还原\n" +
+                "• 它自己装的依赖包不会被清理\n" +
+                "• 需要重启 Forge 之后界面上的入口才会消失",
+                "卸载插件", MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+            if (rs != MessageBoxResult.OK) return;
+
+            var (ok, msg) = ExtensionManager.Uninstall(item, extDir);
+            if (ok)
+            {
+                extItems.Remove(item);
+                ApplyExtFilter();
+                AddLog($"插件「{item.Name}」{msg}。", SuccessBrush);
+            }
+            else
+            {
+                AddLog($"插件「{item.Name}」卸载失败：{msg}", ErrorBrush);
+                MessageBox.Show(msg, "卸载失败", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        /// <summary>
+        /// 刚更新完的那一项：本地只读地刷成"已是最新"，并重挂一次列表。
+        ///
+        /// <para>⚠ <b>只在更新确实成功之后调</b> —— <see cref="ExtensionManager.MarkUpdated"/>
+        /// 会直接断言"已是最新"；更新失败时调它，界面就开始撒谎。</para>
+        ///
+        /// <para><b>这是本版核心诉求的落点</b>：点一个插件的「更新」，只刷新这一个，
+        /// 不发任何网络请求。要重问远程是「检测插件更新」那个按钮的事。</para>
+        /// </summary>
+        private void RefreshOneExt(ExtensionInfo item)
+        {
+            ExtensionManager.MarkUpdated(item);
+            // 列表项是普通 POCO（没实现 INotifyPropertyChanged），改字段不会自己重绘 ——
+            // 重挂一次 ItemsSource 才是"刷新"（ApplyExtFilter 顺带把计数也更新了）。
+            ApplyExtFilter();
         }
 
         private async void ExtUpdate_Click(object sender, RoutedEventArgs e)
         {
             if (versionBusy) return;
             if (sender is not System.Windows.Controls.Button b) return;
-            if (b.Tag is not UpdateItem item) return;
+            if (b.Tag is not ExtensionInfo item) return;
+
+            if (!item.IsGit)
+            {
+                MessageBox.Show(
+                    $"「{item.Name}」不是 git 管理的扩展，没有「远程最新提交」可以对齐。\n\n" +
+                    "它是手工解压 / 拷贝进 extensions 目录的。若想换成能更新的版本：\n" +
+                    "先卸载它，再用仓库地址重新安装。",
+                    "无法更新", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
 
             var rs = MessageBox.Show(
                 $"确定要更新插件「{item.Name}」吗？\n\n" +
                 $"• 当前：{item.CurrentVersion}  →  最新：{item.LatestVersion}\n" +
-                "• 使用 git 强制对齐到远程最新提交（本地未提交改动会被覆盖）",
+                "• 使用 git 强制对齐到远程最新提交（本地未提交改动会被覆盖）\n" +
+                "• 本启动器给扩展打的修正补丁同样会被覆盖 —— 下次启动会重新贴上",
                 "更新插件确认", MessageBoxButton.OKCancel, MessageBoxImage.Question);
             if (rs != MessageBoxResult.OK) return;
 
             versionBusy = true;
-            CheckUpdateBtn.IsEnabled = false;
+            BtnExtCheck.IsEnabled = false;
             UpdateAllBtn.IsEnabled = false;
-            VerStatusText.Text = $"正在更新：{item.Name} ...";
+            ExtStatusText.Text = $"正在更新：{item.Name} ...";
             AddLog($"开始更新插件：{item.Name} ...", WarnBrush);
 
             try
             {
-                var (ok, msg) = await Updater.UpdateExtensionAsync(item);
+                var (ok, msg) = await ExtensionManager.UpdateAsync(item);
                 AddLog((ok ? $"插件 {item.Name} 更新完成：" : $"插件 {item.Name} 更新失败：") + msg,
                        ok ? SuccessBrush : ErrorBrush);
+                // ⚠ 只有成功才刷新那一行：MarkUpdated 会直接断言"已是最新"，
+                //   失败时调它等于让界面撒谎（用户会以为已经对齐了）。
+                Dispatcher.Invoke(() =>
+                {
+                    if (ok) RefreshOneExt(item);
+                    ExtStatusText.Text = $"「{item.Name}」" + (ok ? "更新完成" : "更新失败，详见日志");
+                });
             }
             catch (Exception ex)
             {
@@ -1907,27 +2406,39 @@ namespace ForgeNeoLauncher
             finally
             {
                 versionBusy = false;
-                Dispatcher.Invoke(() => CheckUpdateBtn.IsEnabled = true);
-                await CheckUpdatesAsync();
+                Dispatcher.Invoke(() =>
+                {
+                    BtnExtCheck.IsEnabled = true;
+                    UpdateAllBtn.IsEnabled = extItems.Any(x => x.State == UpdateState.UpdateAvailable);
+                });
             }
         }
 
+        /// <summary>
+        /// 一键更新全部<b>插件</b>。
+        ///
+        /// <para>⚠ 这一页上的「全部」= 全部插件。内核有自己的卡片和「更新内核」按钮
+        /// （在【版本管理】页）—— 混在一起时，"全部"到底含不含内核只能靠猜。</para>
+        /// </summary>
         private async void UpdateAll_Click(object sender, RoutedEventArgs e)
         {
             if (versionBusy) return;
 
-            var exts = ExtList.ItemsSource as List<UpdateItem> ?? new List<UpdateItem>();
-            var updatable = exts.Where(x => x.State == UpdateState.UpdateAvailable).ToList();
-            bool coreUpd = coreItem?.State == UpdateState.UpdateAvailable;
-            if (!coreUpd && updatable.Count == 0) return;
+            // ⚠ 读 extItems（插件全集），**不是** ExtList.ItemsSource ——
+            //   后者可能被搜索框过滤过，那样用户搜了两个字再点「一键更新全部」，
+            //   就只会更新看得见的那几个，而按钮上写着「全部」。
+            var updatable = extItems.Where(x => x.State == UpdateState.UpdateAvailable).ToList();
+            if (updatable.Count == 0) return;
 
             // 前置检查：服务运行中会占用文件
-            bool svcRunning = (proc != null && !proc.HasExited) || GetPortPid() > 0;
+            // ⚠ 只看"我们自己的进程"，**不看端口** —— 端口上那一位可能是别人的程序，
+            //   认成自己就会在下面的「是否先停止服务」里把对方杀掉。
+            bool svcRunning = IsOurForgeRunning();
             if (svcRunning)
             {
                 var r0 = MessageBox.Show(
                     "检测到 Forge Neo 服务正在运行。\n\n" +
-                    "更新会写入源码/插件文件，建议先停止服务。\n\n是否先停止服务再更新？",
+                    "更新会写入插件文件，建议先停止服务。\n\n是否先停止服务再更新？",
                     "服务运行中", MessageBoxButton.YesNoCancel, MessageBoxImage.Warning);
                 if (r0 == MessageBoxResult.Cancel) return;
                 if (r0 == MessageBoxResult.Yes)
@@ -1937,37 +2448,41 @@ namespace ForgeNeoLauncher
                 }
             }
 
-            string list = (coreUpd ? "• Forge Neo 内核\n" : "")
-                        + string.Join("\n", updatable.Select(x => "• " + x.Name));
             var rs = MessageBox.Show(
-                "将更新以下项目：\n\n" + list +
+                $"将更新以下 {updatable.Count} 个插件：\n\n"
+                + string.Join("\n", updatable.Select(x => "• " + x.Name)) +
                 "\n\n插件使用 git 强制对齐到远程（本地未提交改动会被覆盖）。是否继续？",
-                "一键更新全部", MessageBoxButton.OKCancel, MessageBoxImage.Question);
+                "一键更新全部插件", MessageBoxButton.OKCancel, MessageBoxImage.Question);
             if (rs != MessageBoxResult.OK) return;
 
             versionBusy = true;
-            CheckUpdateBtn.IsEnabled = false;
+            BtnExtCheck.IsEnabled = false;
             UpdateAllBtn.IsEnabled = false;
-            CoreUpdateBtn.IsEnabled = false;
 
             try
             {
-                if (coreUpd)
-                {
-                    VerStatusText.Text = "正在更新内核 ...";
-                    AddLog("【一键更新】开始更新内核 ...", WarnBrush);
-                    var (ok, msg) = await Updater.UpdateCoreAsync();
-                    AddLog((ok ? "内核更新完成：" : "内核更新失败：") + msg, ok ? SuccessBrush : ErrorBrush);
-                }
-
                 foreach (var it in updatable)
                 {
-                    VerStatusText.Text = $"正在更新：{it.Name} ...";
+                    ExtStatusText.Text = $"正在更新：{it.Name} ...";
                     AddLog($"【一键更新】{it.Name} ...", WarnBrush);
-                    var (ok, msg) = await Updater.UpdateExtensionAsync(it);
+                    var (ok, msg) = await ExtensionManager.UpdateAsync(it);
                     AddLog((ok ? $"插件 {it.Name} 更新完成：" : $"插件 {it.Name} 更新失败：") + msg,
                            ok ? SuccessBrush : ErrorBrush);
+
+                    // 每更新完一个就刷掉它自己那一行 —— **本地只读、不发网络请求**。
+                    // 老写法是全部跑完再整体检测一次（对每个插件各发一条 git ls-remote），
+                    // 于是"更新 3 个插件"实际会问远程 N+3 次。
+                    if (ok)
+                    {
+                        var done = it;
+                        Dispatcher.Invoke(() => RefreshOneExt(done));
+                    }
                 }
+
+                // 更新会 git reset --hard 掉扩展目录里的改动 —— 包括我们给扩展打的补丁。
+                // 补丁的重新应用在 Start_Click 里（拉起 Forge 之前），这里只是把话说清楚。
+                AddLog("提示：被更新覆盖的扩展补丁，会在下次启动 Forge 之前自动重新贴上。", InfoBrush);
+                Dispatcher.Invoke(() => ExtStatusText.Text = $"更新完成（{DateTime.Now:HH:mm:ss}）");
             }
             catch (Exception ex)
             {
@@ -1976,39 +2491,56 @@ namespace ForgeNeoLauncher
             finally
             {
                 versionBusy = false;
-                Dispatcher.Invoke(() => CheckUpdateBtn.IsEnabled = true);
-                await CheckUpdatesAsync();
+                Dispatcher.Invoke(() =>
+                {
+                    BtnExtCheck.IsEnabled = true;
+                    UpdateAllBtn.IsEnabled = extItems.Any(x => x.State == UpdateState.UpdateAvailable);
+                });
             }
         }
 
-        // ================= 端口探测 =================
-        private static int GetPortPid()
+        // ================= 端口与进程归属 =================
+        // 端口探测统一走 PortGuard（纯函数、可单独跑测试）。
+        // 这里只放"本启动器自己记着的 PID"这类**有状态**的事。
+
+        /// <summary>读 <c>forge.pid</c> 里记的进程号（写它的是 <see cref="WritePid"/>）。读不到返回 -1。</summary>
+        private static int ReadPid()
         {
             try
             {
-                var psi = new ProcessStartInfo("netstat", "-ano")
-                {
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardOutput = true
-                };
-                using var p = Process.Start(psi);
-                if (p == null) return -1;
-                string output = p.StandardOutput.ReadToEnd();
-                p.WaitForExit(2000);
-                foreach (var line in output.Split('\n'))
-                {
-                    if (!line.Contains("LISTENING")) continue;
-                    // TCP  127.0.0.1:7860  0.0.0.0:0  LISTENING  12345
-                    string[] parts = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                    if (parts.Length >= 5 && parts[1].EndsWith(":" + Port) && parts[3] == "LISTENING")
-                    {
-                        if (int.TryParse(parts[4], out int pid)) return pid;
-                    }
-                }
+                var f = Path.Combine(NeoToolDir, "forge.pid");
+                if (!File.Exists(f)) return -1;
+                return int.TryParse(File.ReadAllText(f).Trim(), out var pid) ? pid : -1;
             }
-            catch { }
-            return -1;
+            catch { return -1; }
+        }
+
+        /// <summary>
+        /// 本启动器<b>自己启动的</b> Forge 还在跑吗？
+        ///
+        /// <para>⚠ 判据里<b>不含端口</b>。端口上坐着谁，与"我们有没有在跑"是两件不同的事 ——
+        /// 原先这里写着 <c>|| GetPortPid() &gt; 0</c>，于是别人占着 7860 时：
+        /// 更新内核 / 装 PyTorch 前会弹「服务正在运行」，选「是」就把<b>别人的进程</b>杀掉；
+        /// 关窗口时也会平白多问一次。<b>判据兼职，错在这。</b></para>
+        /// </summary>
+        private bool IsOurForgeRunning()
+        {
+            // ① 我们自己起的子进程 —— 最直接的证据
+            if (proc != null && !proc.HasExited) return true;
+
+            // ② forge.pid 里记的那个（上次会话留下的）。
+            //    PID 会被系统复用，所以既要"活着"也要通过身份判据，
+            //    不能只看"这个号有人用"。
+            int pid = ReadPid();
+            if (pid > 0 && PortGuard.IsAlive(pid) && PortGuard.LooksLikeOurForge(pid, NeoToolDir))
+                return true;
+
+            // ③ 没有记录时（forge.pid 被删过、或服务是用户自己用 webui.bat 起的），
+            //    看配置端口上坐的是不是本包的 Forge
+            if (advOpts.TryPortArg(out var p) && PortGuard.Inspect(p, null, NeoToolDir).IsOurs)
+                return true;
+
+            return false;
         }
 
         // ================= 进程树终止 =================
@@ -2049,7 +2581,9 @@ namespace ForgeNeoLauncher
                         Dispatcher.Invoke(() =>
                         {
                             bool running = proc != null && !proc.HasExited;
-                            int pidV = GetPortPid();
+                            // 查的是**本次实际使用的那个端口**（可能是自动切换过的），
+                            // 而不是写死的 7860 —— 否则自动换端口后就再也探测不到就绪了
+                            int pidV = PortGuard.GetPortPid(currentPort);
 
                             if (running)
                             {
@@ -2092,9 +2626,26 @@ namespace ForgeNeoLauncher
                                     HandleChildExit();
                                 }
 
+                                // 占用者身份只在"端口换人了"时重算一次：
+                                // Describe() 要读进程路径，每秒重算纯属浪费。
+                                if (pidV != idlePid)
+                                {
+                                    idlePid = pidV;
+                                    var op = pidV > 0
+                                        ? PortGuard.Classify(pidV, new[] { ReadPid() }, NeoToolDir)
+                                        : null;
+                                    idleOwnerDesc = op?.OwnerDesc ?? "";
+                                    idleOwnerIsOurs = op?.IsOurs == true;
+                                }
+
                                 if (pidV > 0)
                                 {
-                                    UpdateStatus("已停止", $"端口仍被 pid {pidV} 占用，点击【终止进程】清理");
+                                    // ⚠ 只有确认是本包的 Forge 才"邀请清理"。
+                                    //   别人占着端口时写"点击【终止进程】清理"，
+                                    //   等于诱导用户误杀无关进程。
+                                    UpdateStatus("已停止", idleOwnerIsOurs
+                                        ? $"端口 {currentPort} 仍被本包 Forge (PID {pidV}) 占用，可点【终止进程】清理"
+                                        : $"端口 {currentPort} 被其他程序占用：{idleOwnerDesc}");
                                 }
                                 else
                                 {
@@ -2931,6 +3482,8 @@ namespace ForgeNeoLauncher
             advOpts.Api = loaded.Api;
             advOpts.Listen = loaded.Listen;
             advOpts.GradioAuth = loaded.GradioAuth;
+            advOpts.Port = loaded.Port;
+            advOpts.AutoSwitchPort = loaded.AutoSwitchPort;
             advOpts.MirrorSource = loaded.MirrorSource;
             advOpts.UseA1111Home = loaded.UseA1111Home;
             advOpts.A1111Home = loaded.A1111Home;
@@ -2961,6 +3514,8 @@ namespace ForgeNeoLauncher
                 SwApi.IsChecked = advOpts.Api;
                 SwListen.IsChecked = advOpts.Listen;
                 AuthBox.Text = advOpts.GradioAuth;
+                PortBox.Text = advOpts.Port;
+                SwAutoSwitchPort.IsChecked = advOpts.AutoSwitchPort;
                 SwInstallExtDeps.IsChecked = advOpts.InstallExtDeps;
 
                 SwA1111Home.IsChecked = advOpts.UseA1111Home;
@@ -3017,6 +3572,14 @@ namespace ForgeNeoLauncher
         /// 而拼命令行时只有解析成正数的值才会真的发出去（AppendTo）。
         /// </summary>
         private void AdvReserveVram_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
+        {
+            if (advLoading) return;
+            SyncFromUi();
+            RefreshPreview();
+        }
+
+        /// <summary>服务端口输入变化。同预留显存：半成品也照收，合法性由 ValidateFatal 说。</summary>
+        private void AdvPort_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
         {
             if (advLoading) return;
             SyncFromUi();
@@ -3127,6 +3690,10 @@ namespace ForgeNeoLauncher
             advOpts.Api = SwApi.IsChecked == true;
             advOpts.Listen = SwListen.IsChecked == true;
             advOpts.GradioAuth = AuthBox.Text ?? "";
+            // 同 ReserveVram：原样收下界面文本，合法与否交给 TryPortArg / ValidateFatal 判。
+            // 收成 int 的话，"删光了准备重打"的中间态会被静默变成 0，界面与实际就对不上了。
+            advOpts.Port = PortBox?.Text ?? "";
+            advOpts.AutoSwitchPort = SwAutoSwitchPort == null || SwAutoSwitchPort.IsChecked == true;
             // 它不进 AppendTo —— 由 BuildFinalArgs() 裁决发不发 --skip-install
             advOpts.InstallExtDeps = SwInstallExtDeps == null || SwInstallExtDeps.IsChecked == true;
             advOpts.MirrorSource = (SourceBox?.SelectedItem as SourceOption)?.Id
@@ -3516,7 +4083,9 @@ namespace ForgeNeoLauncher
             bool isDowngradeOrChange = !build.IsCurrent;
 
             // 服务运行中时装 torch 是灾难：正在被加载的 torch DLL 会被覆盖
-            bool svcRunning = (proc != null && !proc.HasExited) || GetPortPid() > 0;
+            // ⚠ 只看"我们自己的进程"，**不看端口** —— 端口上那一位可能是别人的程序，
+            //   认成自己就会在下面的「是否先停止服务」里把对方杀掉。
+            bool svcRunning = IsOurForgeRunning();
             if (svcRunning)
             {
                 var r0 = MessageBox.Show(
@@ -3587,7 +4156,8 @@ namespace ForgeNeoLauncher
         // ================= 关闭确认 =================
         private void OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
         {
-            bool running = (proc != null && !proc.HasExited) || GetPortPid() > 0;
+            // 同 svcRunning：判据不含端口，否则别人占着端口时会平白多问一次"是否停止服务"
+            bool running = IsOurForgeRunning();
             if (running)
             {
                 var rs = MessageBox.Show(

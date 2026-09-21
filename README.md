@@ -27,9 +27,10 @@
 | **首页** | 大字启动按钮、常用文件夹快捷入口、运行状态一览 |
 | **一键部署** | 打开即体检：内核文件 → venv → 随包运行时。不合格自动跳转 |
 | **实时日志** | 直接读 Forge 的 stdout，不伪造百分比；跑图时进度按真实 tqdm 走 |
-| **版本管理** | 内核与各扩展的更新检测，可逐项更新 |
-| **高级选项** | 常用命令行参数可视化，含参数预览 |
+| **内核更新** | 检测上游仓库的分支与提交，只更新 Forge Neo 本体 |
+| **插件管理** | 独立一页：列出全部扩展（含手动解压、没有 `.git` 的那些），装 / 卸 / 启停 / 逐项更新 |
 | **PyTorch 环境** | 按显卡算力挑选 torch / torchvision 组合，独立安装进 venv |
+| **高级选项** | 常用命令行参数可视化（含服务端口，被占用时可自动让位），含参数预览 |
 | **依赖下载源** | 国内镜像（阿里云 PyPI + 上海交大 torch wheel）/ 官方源，一键切换 |
 | **主题** | 浅色 / 深色，偏好写进 `launcher.cfg` |
 
@@ -63,7 +64,7 @@
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-产物为 `_published\ForgeNeoLauncher.exe` —— 自包含单文件，约 70 MB。
+产物为 `_published\ForgeNeoLauncher.exe` —— 自包含单文件，约 73 MB。
 
 ## 目录结构
 
@@ -79,11 +80,19 @@ launcher-src/
   DeployState.cs         三态体检
   DeployManager.cs       建 venv（只管这一步）
   TorchManager.cs        PyTorch 环境
-  UpdateChecker.cs       内核 / 插件更新检测
+  PortGuard.cs           端口探测与归属判断（是谁占着）
+  UpdateHttp.cs          HTTPS 拉取（GitHub 要带 UA，否则 403）
+  UpdateInfo.cs          两个更新模型 + UpdateState
+  CoreUpdater.cs         内核的检测与更新
+  ExtensionManager.cs    插件：扫描 / 检测 / 更新 / 装 / 卸 / 启停
+  GitRunner.cs           所有 git 调用的唯一收口
+  RecycleBin.cs          删除走系统回收站
   HomeFolders.cs         首页文件夹入口
   Theme.cs  UiFx.cs      主题与动效
 build.ps1                构建脚本
 ```
+
+> 更新检测一旦成功，界面只刷新**受影响的那一项**（读一次本地 HEAD，不联网）—— 会发网络请求的只有你亲手点的【检测内核更新】/【检测插件更新】。
 
 ## 设计上的一条主线
 

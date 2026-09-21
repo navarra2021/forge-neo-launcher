@@ -15,10 +15,18 @@ namespace ForgeNeoLauncher
     /// 这样「预览的命令行」和「真正启动用的命令行」必然一致，
     /// 不会出现勾了没生效、或者预览与实际不符的坑。
     ///
-    /// 所有参数名都核对过本机 Forge Neo（v0.x）的 argparse 定义：
-    ///   - modules/cmd_args.py    （--no-hashing / --api / --listen / --gradio-auth / --ckpt-dirs ...）
-    ///   - backend/args.py        （--cuda-malloc / --cuda-stream / --pin-shared-memory / --autotune ...）
-    /// 没有把握的参数一律不做进界面——写错的 flag 会让启动直接崩在 argparse。
+    /// 所有参数名都核对过本机 Forge Neo（v0.x）的 argparse 定义。
+    ///
+    /// <para>⚠ <b>参数注册点不止一处，别只 grep 那两个文件</b>（v0.29 实测更正）：
+    /// <c>modules/cmd_args.py</c>（--no-hashing / --api / --listen / --gradio-auth / --port）、
+    /// <c>backend/args.py</c>（--cuda-malloc / --cuda-stream / --pin-shared-memory / --autotune）、
+    /// <b><c>modules/paths_internal.py</c></b>（目录类参数 <c>--ckpt-dirs</c>/<c>--lora-dirs</c>/<c>--vae-dirs</c> 其实在这）、
+    /// <c>modules/timer.py</c>、<c>modules_forge/shared.py</c>、
+    /// 以及 <c>extensions-builtin/*/preload.py</c> 与 <c>extensions/*/preload.py</c>
+    /// （内置/第三方扩展也能注册，如 <c>--lora-dir</c>、<c>--controlnet-loglevel</c>）。
+    /// 只查前两个会把<b>真实存在</b>的参数误判成不存在。</para>
+    ///
+    /// <para>没有把握的参数一律不做进界面——写错的 flag 会让启动直接崩在 argparse。</para>
     /// </summary>
     internal sealed class AdvancedOptions
     {
@@ -86,6 +94,38 @@ namespace ForgeNeoLauncher
         public bool Listen;
         /// <summary>访问认证 username:password</summary>
         public string GradioAuth = "";
+
+        /// <summary>
+        /// 服务端口（<c>--port</c>）。存的是<b>界面原始文本</b>，理由同
+        /// <see cref="ReserveVram"/>：合法与否要能被 <see cref="ValidateFatal"/> 指出来，
+        /// 不能悄悄变成别的数。
+        /// </summary>
+        public string Port = PortGuard.DefaultPort.ToString(CultureInfo.InvariantCulture);
+
+        /// <summary>
+        /// 目标端口被<b>别的程序</b>占用时，自动往后找一个空闲端口（默认开）。
+        ///
+        /// <para>⚠ 这里刻意<b>只</b>对"别的程序"生效。如果占端口的是<b>本包的 Forge</b>
+        /// （上一次没退干净、或用户自己用 <c>webui.bat</c> 起的），那是"服务已经在跑"，
+        /// 该做的是接管监控，而不是再开一个实例。</para>
+        ///
+        /// <para>默认开而是可关：换了端口访问地址就变了（书签、第三方客户端的
+        /// <c>--api</c> 地址、油猴脚本都得跟着改），所以必须给用户一个说"不换"的机会。
+        /// 关掉时若端口被外人占用，启动器<b>只报错、绝不动那个进程</b>。</para>
+        /// </summary>
+        public bool AutoSwitchPort = true;
+
+        /// <summary>
+        /// <b>本次启动实际使用</b>的端口。null = 用 <see cref="Port"/> 里配置的那个。
+        ///
+        /// <para>为什么需要这个运行时字段：端口是"配置项"也是"运行事实"，
+        /// 自动切换只改变后者。让 <see cref="AppendTo"/> 统一读它（而不是让启动流程
+        /// 拿去改命令行），才能保住这条设计原则 ——
+        /// <b>预览的命令行与真正启动用的命令行必然一致</b>。</para>
+        ///
+        /// <para>⚠ 它<b>不落盘</b>：这是本次运行的临时事实，不是用户的配置。</para>
+        /// </summary>
+        public int? EffectivePort;
 
         /// <summary>
         /// 启动时检查并补装扩展依赖（默认<b>开</b>）。
@@ -180,6 +220,19 @@ namespace ForgeNeoLauncher
             if (DisableXformers) args.Add("--disable-xformers");
 
             // ---- 服务与网络 ----
+            // 服务端口。**显式发出去**（而不是让 gradio 自己挑）解决两个问题：
+            //   ① 端口变得确定。不给 --port 时 gradio 会从 7860 起静默往上找 100 个
+            //      （gradio/http_server.py 的 TRY_NUM_PORTS），启动器就不知道服务
+            //      到底在哪 —— 探测就绪、开浏览器、停止服务会全指向错的端口。
+            //   ② 消掉 webui.py 里的一处不一致：只开 API 时它写的是
+            //      `port=cmd_opts.port if cmd_opts.port else 7861`，
+            //      端口为空时界面与 API 会分散在两个端口上。指定后两者一致。
+            if (TryEffectivePortArg(out var portNum))
+            {
+                args.Add("--port");
+                args.Add(portNum.ToString(CultureInfo.InvariantCulture));
+            }
+
             // 刻意不发 --autolaunch：子进程带着 SD_WEBUI_RESTARTING=1，它一定是空转，
             // 传了只会让人以为"这个开关在管事"。开界面由启动器自己负责（见 AutoOpenBrowser）。
             if (Api) args.Add("--api");
@@ -221,6 +274,39 @@ namespace ForgeNeoLauncher
             if (double.IsNaN(gb) || double.IsInfinity(gb) || gb <= 0) return false;
             value = gb.ToString("0.###", CultureInfo.InvariantCulture);
             return true;
+        }
+
+        /// <summary>
+        /// 把「服务端口」的输入文本解析成端口号。
+        /// 返回 false = 不可用（空串 / 不是整数 / 越界）。
+        ///
+        /// <para>用 InvariantCulture：某些区域设置下整数会带千位分隔符，
+        /// 不能让"机器怎么设置"影响解析结果。</para>
+        /// </summary>
+        public bool TryPortArg(out int port)
+        {
+            port = 0;
+            var t = (Port ?? "").Trim();
+            if (t.Length == 0) return false;
+            if (!int.TryParse(t, NumberStyles.Integer, CultureInfo.InvariantCulture, out var v)) return false;
+            if (v < 1 || v > 65535) return false;
+            port = v;
+            return true;
+        }
+
+        /// <summary>
+        /// 本次启动<b>实际</b>该用的端口：自动切换过就用切换后的，否则用配置里的。
+        /// 返回 false = 端口不可用（此时不发 <c>--port</c>，交由 gradio 自己挑 ——
+        /// 但启动流程会先一步拦住，见 <c>MainWindow.Start_Click</c>）。
+        /// </summary>
+        public bool TryEffectivePortArg(out int port)
+        {
+            if (EffectivePort.HasValue)
+            {
+                port = EffectivePort.Value;
+                return port >= 1 && port <= 65535;
+            }
+            return TryPortArg(out port);
         }
 
         /// <summary>认证串：允许多组，用逗号分隔；单组时规范化为 u:p</summary>
@@ -289,6 +375,14 @@ namespace ForgeNeoLauncher
             if (rv.Length > 0 && !TryReserveVramArg(out _))
                 list.Add($"预留显存「{rv}」不是有效的正数（单位 GB，例如 0.5 或 1），该参数不会生效。请改正或留空。");
 
+            // 端口必须给一个可用值。留空的话启动器不知道服务会落在哪儿
+            //（webui.py 里 API 模式还会另挑 7861），探测、开浏览器、停止就全失去准头。
+            var pt = (Port ?? "").Trim();
+            if (pt.Length == 0)
+                list.Add($"服务端口不能为空，请填 1~65535 之间的整数（默认 {PortGuard.DefaultPort}）。");
+            else if (!TryPortArg(out _))
+                list.Add($"服务端口「{pt}」不是有效的端口，请填 1~65535 之间的整数（例如 {PortGuard.DefaultPort}）。");
+
             return list.Distinct().ToList();
         }
 
@@ -327,6 +421,16 @@ namespace ForgeNeoLauncher
                     list.Add("已开启 A1111 模型复用：这是本机专属设置，把包拷到没有 A1111 的电脑上会启动失败，届时清空此项即可。");
             }
 
+            // 本次启动换过端口：地址跟着变了，得让人知道去哪儿看界面
+            if (EffectivePort.HasValue && TryPortArg(out var cfgPort) && EffectivePort.Value != cfgPort)
+                list.Add($"原端口 {cfgPort} 被其他程序占用，本次启动改用 {EffectivePort.Value}。"
+                       + $"访问地址：http://127.0.0.1:{EffectivePort.Value}");
+
+            // ⚠ 刻意**不**在这里查"端口有没有被占用"：那是运行时事实，不是配置合法性。
+            //   本方法由 RefreshPreview() 在每次输入/勾选时调用，塞个 netstat 进去
+            //   等于每敲一键就起一个进程。占用情况由 Start_Click 在启动那一刻查，
+            //   并在控制台把占用者是谁、要不要换端口说清楚。
+
             if (!AutoOpenBrowser)
                 list.Add("已关闭「就绪后自动打开界面」：服务起来后不会再弹浏览器，需要时点主界面的【打开界面】。");
 
@@ -358,6 +462,10 @@ namespace ForgeNeoLauncher
             LauncherConfig.SetBool("Adv.Api", Api);
             LauncherConfig.SetBool("Adv.Listen", Listen);
             LauncherConfig.Set("Adv.GradioAuth", GradioAuth ?? "");
+            LauncherConfig.Set("Adv.Port", (Port ?? "").Trim());
+            LauncherConfig.SetBool("Adv.AutoSwitchPort", AutoSwitchPort);
+            // ⚠ EffectivePort 刻意不落盘：它是"本次启动实际用了哪个端口"的临时事实，
+            //   不是用户配置。存下来会让下次打开时误以为用户设的就是那个端口。
             // ⚠ 默认值必须与 Load() 的兜底一致（都是 false）：cfg 里没这一项时读到「关」。
             //   默认值由 true 改为 false 是 2026-09-17 基于实测的修正 ——
             //   理由见字段声明处「踩过的坑（二）」。
@@ -391,6 +499,12 @@ namespace ForgeNeoLauncher
                 Api = LauncherConfig.GetBool("Adv.Api"),
                 Listen = LauncherConfig.GetBool("Adv.Listen"),
                 GradioAuth = LauncherConfig.Get("Adv.GradioAuth"),
+                // 老配置文件没有这一项 -> 空串，这里补齐默认值，
+                // 否则升级上来的用户会看到空的端口框、一启动就被拦下来
+                Port = string.IsNullOrWhiteSpace(LauncherConfig.Get("Adv.Port"))
+                        ? PortGuard.DefaultPort.ToString(CultureInfo.InvariantCulture)
+                        : LauncherConfig.Get("Adv.Port"),
+                AutoSwitchPort = LauncherConfig.GetBool("Adv.AutoSwitchPort", true),
                 // 默认 true：老配置文件缺这一项时升级即生效（与 Save() 的默认值一致）
                 InstallExtDeps = LauncherConfig.GetBool("Adv.InstallExtDeps", true),
                 // Normalize 兜底：老配置文件里没这一项时读到空串，会退化成默认值
@@ -410,6 +524,8 @@ namespace ForgeNeoLauncher
             NoHashing = false; Autotune = false; PinSharedMemory = false; ExpandableSegments = false;
             ReserveVram = ""; DisableSage = false; DisableFlash = false; DisableXformers = false;
             AutoOpenBrowser = true; Api = false; Listen = false; GradioAuth = "";
+            Port = PortGuard.DefaultPort.ToString(CultureInfo.InvariantCulture);
+            AutoSwitchPort = true; EffectivePort = null;
             InstallExtDeps = false;
             MirrorSource = ForgeNeoLauncher.DownloadSource.Cn;
             UseA1111Home = false; A1111Home = "";
