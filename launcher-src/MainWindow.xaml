@@ -542,7 +542,7 @@
                     <TextBlock Text="Forge Neo 启动器" FontSize="12.5" Margin="8,0,0,0"
                                VerticalAlignment="Center"
                                Foreground="{DynamicResource TitleBarText}"/>
-                    <TextBlock x:Name="TitleVersionText" Text="v0.28" FontSize="11" Margin="7,0,0,0"
+                    <TextBlock x:Name="TitleVersionText" Text="v0.29" FontSize="11" Margin="7,0,0,0"
                                VerticalAlignment="Center"
                                Foreground="{DynamicResource SubtitleText}"/>
                 </StackPanel>
@@ -594,7 +594,7 @@
                                    HorizontalAlignment="Center" Margin="0,6,0,0"/>
                         <Border Background="{DynamicResource CardBg}" BorderBrush="{DynamicResource CardBorder}"
                                 BorderThickness="1" CornerRadius="4" Padding="5,1" Margin="0,4,0,0">
-                            <TextBlock x:Name="LogoVersionText" Text="v0.28"
+                            <TextBlock x:Name="LogoVersionText" Text="v0.29"
                                        Foreground="{DynamicResource SubtitleText}" FontSize="8.5"
                                        HorizontalAlignment="Center"/>
                         </Border>
@@ -1053,7 +1053,7 @@
                                                Foreground="{DynamicResource TopBtnText}" VerticalAlignment="Center"/>
                                     <Border Background="{DynamicResource CardBg}" BorderBrush="{DynamicResource CardBorder}"
                                             BorderThickness="1" CornerRadius="4" Padding="6,2" Margin="10,0,0,0" VerticalAlignment="Center">
-                                        <TextBlock x:Name="VerLauncherVerText" Text="启动器 v0.28"
+                                        <TextBlock x:Name="VerLauncherVerText" Text="启动器 v0.29"
                                                    Foreground="{DynamicResource SubtitleText}" FontSize="10.5"/>
                                     </Border>
                                     <TextBlock x:Name="VerStatusText" Text="" FontSize="12" Margin="14,0,0,0"
@@ -1381,7 +1381,7 @@
                                         </Border>
 
                                         <Border Background="{DynamicResource CardBg}" BorderBrush="{DynamicResource CardBorder}"
-                                                BorderThickness="1" CornerRadius="10" Padding="16,13">
+                                                BorderThickness="1" CornerRadius="10" Padding="16,13" Margin="0,0,0,10">
                                             <StackPanel>
                                                 <TextBlock Text="内存与显存" Style="{StaticResource AdvLabel}" FontWeight="SemiBold"/>
                                                 <TextBlock Text="模型在显存装不下时会暂存到内存，这一组改善两边之间的搬运效率。" Style="{StaticResource AdvHint}" Margin="0,2,0,10"/>
@@ -1403,6 +1403,63 @@
                                                         <TextBlock Text="可扩展显存段" Style="{StaticResource AdvLabel}"/>
                                                         <TextBlock Style="{StaticResource AdvHint}" Margin="0,2,12,0"
                                                                    Text="对应 --expandable-segments。缓解显存碎片，但属实验性选项，遇到生成异常可先关掉它。"/>
+                                                    </StackPanel>
+                                                </DockPanel>
+                                            </StackPanel>
+                                        </Border>
+
+                                        <!-- 显存预留 -->
+                                        <Border Background="{DynamicResource CardBg}" BorderBrush="{DynamicResource CardBorder}"
+                                                BorderThickness="1" CornerRadius="10" Padding="16,13" Margin="0,0,0,10">
+                                            <StackPanel>
+                                                <TextBlock Text="显存预留" Style="{StaticResource AdvLabel}" FontWeight="SemiBold"/>
+                                                <TextBlock Style="{StaticResource AdvHint}" Margin="0,2,0,7" TextWrapping="Wrap"
+                                                           Text="对应 --reserve-vram。主动让出一部分显存给同时运行的其他程序（游戏、剪辑、另一个 WebUI），避免两边互相抢到爆显存。留空 = 不启用。"/>
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="110"/>
+                                                        <ColumnDefinition Width="*"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBox x:Name="ReserveVramBox" Grid.Column="0" Style="{StaticResource AdvInput}"
+                                                             TextChanged="AdvReserveVram_TextChanged"/>
+                                                    <TextBlock Grid.Column="1" Text="GB（例如 0.5 或 1）" Style="{StaticResource AdvHint}"
+                                                               Margin="8,0,0,0" VerticalAlignment="Center"/>
+                                                </Grid>
+                                            </StackPanel>
+                                        </Border>
+
+                                        <!-- 注意力后端 -->
+                                        <Border Background="{DynamicResource CardBg}" BorderBrush="{DynamicResource CardBorder}"
+                                                BorderThickness="1" CornerRadius="10" Padding="16,13">
+                                            <StackPanel>
+                                                <TextBlock Text="注意力后端（排障用）" Style="{StaticResource AdvLabel}" FontWeight="SemiBold"/>
+                                                <TextBlock Style="{StaticResource AdvHint}" Margin="0,2,0,10" TextWrapping="Wrap"
+                                                           Text="正常情况下由 Forge 自动挑选，这三个都该关着。只有在「注意力后端加载失败」或生成结果异常需要逐个排除时，才勾掉对应的那个。"/>
+
+                                                <DockPanel Margin="0,0,0,10">
+                                                    <ToggleButton x:Name="SwDisableSage" DockPanel.Dock="Right" Style="{StaticResource Switch}"
+                                                                  VerticalAlignment="Center" Checked="AdvOption_Toggled" Unchecked="AdvOption_Toggled"/>
+                                                    <StackPanel>
+                                                        <TextBlock Text="关闭 sageattention" Style="{StaticResource AdvLabel}"/>
+                                                        <TextBlock Text="对应 --disable-sage" Style="{StaticResource AdvHint}" Margin="0,2,12,0"/>
+                                                    </StackPanel>
+                                                </DockPanel>
+
+                                                <DockPanel Margin="0,0,0,10">
+                                                    <ToggleButton x:Name="SwDisableFlash" DockPanel.Dock="Right" Style="{StaticResource Switch}"
+                                                                  VerticalAlignment="Center" Checked="AdvOption_Toggled" Unchecked="AdvOption_Toggled"/>
+                                                    <StackPanel>
+                                                        <TextBlock Text="关闭 flash_attn" Style="{StaticResource AdvLabel}"/>
+                                                        <TextBlock Text="对应 --disable-flash" Style="{StaticResource AdvHint}" Margin="0,2,12,0"/>
+                                                    </StackPanel>
+                                                </DockPanel>
+
+                                                <DockPanel>
+                                                    <ToggleButton x:Name="SwDisableXformers" DockPanel.Dock="Right" Style="{StaticResource Switch}"
+                                                                  VerticalAlignment="Center" Checked="AdvOption_Toggled" Unchecked="AdvOption_Toggled"/>
+                                                    <StackPanel>
+                                                        <TextBlock Text="关闭 xformers" Style="{StaticResource AdvLabel}"/>
+                                                        <TextBlock Text="对应 --disable-xformers" Style="{StaticResource AdvHint}" Margin="0,2,12,0"/>
                                                     </StackPanel>
                                                 </DockPanel>
                                             </StackPanel>
@@ -1645,7 +1702,7 @@
 
                                         <!-- VAE -->
                                         <Border Background="{DynamicResource CardBg}" BorderBrush="{DynamicResource CardBorder}"
-                                                BorderThickness="1" CornerRadius="10" Padding="16,13">
+                                                BorderThickness="1" CornerRadius="10" Padding="16,13" Margin="0,0,0,10">
                                             <StackPanel>
                                                 <TextBlock Text="VAE" Style="{StaticResource AdvLabel}" FontWeight="SemiBold"/>
                                                 <TextBlock Text="对应 --vae-dirs" Style="{StaticResource AdvHint}" Margin="0,2,0,7"/>
@@ -1666,6 +1723,35 @@
                                                                 Tag="vae" Click="AdvDirAdd_Click"/>
                                                         <Button Content="移除选中" Style="{StaticResource TopBtn}" Height="26" Width="72" Margin="0,6,0,0"
                                                                 Tag="vae" Click="AdvDirRemove_Click"/>
+                                                    </StackPanel>
+                                                </Grid>
+                                            </StackPanel>
+                                        </Border>
+
+                                        <!-- Text Encoder -->
+                                        <Border Background="{DynamicResource CardBg}" BorderBrush="{DynamicResource CardBorder}"
+                                                BorderThickness="1" CornerRadius="10" Padding="16,13">
+                                            <StackPanel>
+                                                <TextBlock Text="Text Encoder 文本编码器" Style="{StaticResource AdvLabel}" FontWeight="SemiBold"/>
+                                                <TextBlock Style="{StaticResource AdvHint}" Margin="0,2,0,7" TextWrapping="Wrap"
+                                                           Text="对应 --text-encoder-dirs。Flux / Qwen 这类模型把文本编码器单独存放，目录不写在这里，WebUI 会「模型在、却报找不到文本编码器」。"/>
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <Border Grid.Column="0" Background="{DynamicResource WindowBg}"
+                                                            BorderBrush="{DynamicResource CardBorder}" BorderThickness="1" CornerRadius="7">
+                                                        <ListBox x:Name="TextEncList" Background="Transparent" BorderThickness="0"
+                                                                 Height="84" Padding="3"
+                                                                 ItemContainerStyle="{StaticResource AdvListItem}"
+                                                                 ScrollViewer.HorizontalScrollBarVisibility="Disabled"/>
+                                                    </Border>
+                                                    <StackPanel Grid.Column="1" Margin="8,0,0,0">
+                                                        <Button Content="添加目录" Style="{StaticResource TopBtn}" Height="26" Width="72"
+                                                                Tag="textenc" Click="AdvDirAdd_Click"/>
+                                                        <Button Content="移除选中" Style="{StaticResource TopBtn}" Height="26" Width="72" Margin="0,6,0,0"
+                                                                Tag="textenc" Click="AdvDirRemove_Click"/>
                                                     </StackPanel>
                                                 </Grid>
                                             </StackPanel>

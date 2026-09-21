@@ -130,6 +130,12 @@ namespace ForgeNeoLauncher
             // 所以额外影响为零 —— 只关掉"自动开浏览器"，不动别的启动流程。
             psi.Environment["SD_WEBUI_RESTARTING"] = "1";
 
+            // 本机地址不走系统代理。
+            // 装了 Clash / Steam++ 这类全局代理时，不设这个会让 WebUI 把 localhost 判成
+            // 「不可达」并打出 When localhost is not accessible...（报错里一个"代理"字都没有），
+            // 服务明明就在本机却起不来。合并语义与理由见 ProxyEnv.cs。
+            ProxyEnv.Apply(psi);
+
             // uv 的其余隔离项 + 下载源
             DeployManager.ApplyUvEnv(psi);
             DeployManager.ApplySourceEnv(psi, advOpts.MirrorSource);
@@ -772,6 +778,8 @@ namespace ForgeNeoLauncher
                 header.AppendLine($"Python     : {PythonPath}");
                 header.AppendLine($"服务地址   : {WebUiUrl}");
                 header.AppendLine($"端口       : {Port}");
+                // 排查「localhost is not accessible」时第一眼要看的东西
+                header.AppendLine($"代理绕过   : {ProxyEnv.MergeNoProxy(Environment.GetEnvironmentVariable("NO_PROXY"))}");
                 header.AppendLine($"当前状态   : {StateText.Text} {StateDetail.Text}");
                 header.AppendLine("=================================================");
                 header.AppendLine();
@@ -2782,9 +2790,10 @@ namespace ForgeNeoLauncher
                     }
                 }
 
-                // 额外模型目录（--ckpt-dirs / --lora-dirs / --vae-dirs）也提一句，
-                // 免得用户以为模型只可能在一个地方
-                int extra = advOpts.CkptDirs.Count + advOpts.LoraDirs.Count + advOpts.VaeDirs.Count;
+                // 额外模型目录（--ckpt-dirs / --lora-dirs / --vae-dirs / --text-encoder-dirs）
+                // 也提一句，免得用户以为模型只可能在一个地方
+                int extra = advOpts.CkptDirs.Count + advOpts.LoraDirs.Count
+                          + advOpts.VaeDirs.Count + advOpts.TextEncoderDirs.Count;
                 if (extra > 0 && homeFolders.FirstOrDefault(f => f.Key == HomeFolders.KeyModels) is { } mm)
                     mm.Sub += $"　·　另加 {extra} 个目录";
 
@@ -2928,6 +2937,7 @@ namespace ForgeNeoLauncher
             advOpts.CkptDirs = new List<string>(loaded.CkptDirs);
             advOpts.LoraDirs = new List<string>(loaded.LoraDirs);
             advOpts.VaeDirs = new List<string>(loaded.VaeDirs);
+            advOpts.TextEncoderDirs = new List<string>(loaded.TextEncoderDirs);
         }
 
         /// <summary>把 advOpts 刷进控件（每次进入页面都刷，保证与配置一致）</summary>
@@ -2942,6 +2952,10 @@ namespace ForgeNeoLauncher
                 SwAutotune.IsChecked = advOpts.Autotune;
                 SwPinShared.IsChecked = advOpts.PinSharedMemory;
                 SwExpandSeg.IsChecked = advOpts.ExpandableSegments;
+                ReserveVramBox.Text = advOpts.ReserveVram;
+                SwDisableSage.IsChecked = advOpts.DisableSage;
+                SwDisableFlash.IsChecked = advOpts.DisableFlash;
+                SwDisableXformers.IsChecked = advOpts.DisableXformers;
 
                 SwAutoOpen.IsChecked = advOpts.AutoOpenBrowser;
                 SwApi.IsChecked = advOpts.Api;
@@ -2955,6 +2969,7 @@ namespace ForgeNeoLauncher
                 FillDirList(CkptList, advOpts.CkptDirs);
                 FillDirList(LoraList, advOpts.LoraDirs);
                 FillDirList(VaeList, advOpts.VaeDirs);
+                FillDirList(TextEncList, advOpts.TextEncoderDirs);
             }
             finally { advLoading = false; }
 
@@ -2990,6 +3005,18 @@ namespace ForgeNeoLauncher
         }
 
         private void AdvA1111_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
+        {
+            if (advLoading) return;
+            SyncFromUi();
+            RefreshPreview();
+        }
+
+        /// <summary>
+        /// 预留显存输入变化。逐字符同步会顺手把「0.」「-」这类半成品也写进模型 ——
+        /// 那是刻意的：预览要如实反映"现在填的是什么"，合法性由 ValidateFatal 提示，
+        /// 而拼命令行时只有解析成正数的值才会真的发出去（AppendTo）。
+        /// </summary>
+        private void AdvReserveVram_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
         {
             if (advLoading) return;
             SyncFromUi();
@@ -3090,6 +3117,11 @@ namespace ForgeNeoLauncher
             advOpts.Autotune = SwAutotune.IsChecked == true;
             advOpts.PinSharedMemory = SwPinShared.IsChecked == true;
             advOpts.ExpandableSegments = SwExpandSeg.IsChecked == true;
+            // 原样收下界面文本，合法与否交给 TryReserveVramArg / ValidateFatal 判
+            advOpts.ReserveVram = ReserveVramBox?.Text ?? "";
+            advOpts.DisableSage = SwDisableSage?.IsChecked == true;
+            advOpts.DisableFlash = SwDisableFlash?.IsChecked == true;
+            advOpts.DisableXformers = SwDisableXformers?.IsChecked == true;
 
             advOpts.AutoOpenBrowser = SwAutoOpen.IsChecked == true;
             advOpts.Api = SwApi.IsChecked == true;
@@ -3186,8 +3218,14 @@ namespace ForgeNeoLauncher
         private void AdvDirRemove_Click(object sender, RoutedEventArgs e)
         {
             string kind = (sender as System.Windows.Controls.Button)?.Tag as string ?? "";
-            var box = kind == "ckpt" ? CkptList : kind == "lora" ? LoraList : VaeList;
-            int idx = box?.SelectedIndex ?? -1;
+            var box = GetDirBox(kind);
+            if (box == null)
+            {
+                AddLog($"内部错误：未知的模型目录类型「{kind}」，本次操作已忽略。", WarnBrush);
+                return;
+            }
+
+            int idx = box.SelectedIndex;
             if (idx < 0)
             {
                 SetAdvMessage("请先在列表里选中要移除的目录。", false);
@@ -3206,9 +3244,29 @@ namespace ForgeNeoLauncher
         {
             switch (kind)
             {
+                case "ckpt": return advOpts.CkptDirs;
                 case "lora": return advOpts.LoraDirs;
                 case "vae": return advOpts.VaeDirs;
-                default: return advOpts.CkptDirs;
+                case "textenc": return advOpts.TextEncoderDirs;
+                // ⚠ 未知 Tag 不许静默落回 ckpt：那会把「按钮 Tag 拼错」表现成
+                //   「目录加进了 Checkpoint 列表」，界面上完全看不出异常。
+                //   宁可什么都不做，并在日志里点名。
+                default:
+                    AddLog($"内部错误：未知的模型目录类型「{kind}」，本次操作已忽略。", WarnBrush);
+                    return new List<string>();
+            }
+        }
+
+        /// <summary>取某一类目录的列表控件（只用于读选中项；未知 Tag 返回 null）</summary>
+        private System.Windows.Controls.ListBox? GetDirBox(string kind)
+        {
+            switch (kind)
+            {
+                case "ckpt": return CkptList;
+                case "lora": return LoraList;
+                case "vae": return VaeList;
+                case "textenc": return TextEncList;
+                default: return null;
             }
         }
 
@@ -3217,6 +3275,7 @@ namespace ForgeNeoLauncher
             FillDirList(CkptList, advOpts.CkptDirs);
             FillDirList(LoraList, advOpts.LoraDirs);
             FillDirList(VaeList, advOpts.VaeDirs);
+            FillDirList(TextEncList, advOpts.TextEncoderDirs);
         }
 
         // ================= 预览与保存 =================

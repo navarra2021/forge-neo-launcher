@@ -23,10 +23,10 @@
     <ApplicationIcon>icon\face_adaptive.ico</ApplicationIcon>
     <!-- 版本信息（会写入 exe 文件属性）-->
     <!-- 0.x 阶段采用线性递进编号：0.1 → 0.9 → 0.10 → 0.100，此处两段式写法 -->
-    <Version>0.28</Version>
-    <AssemblyVersion>0.28.0.0</AssemblyVersion>
-    <FileVersion>0.28.0.0</FileVersion>
-    <InformationalVersion>0.28</InformationalVersion>
+    <Version>0.29</Version>
+    <AssemblyVersion>0.29.0.0</AssemblyVersion>
+    <FileVersion>0.29.0.0</FileVersion>
+    <InformationalVersion>0.29</InformationalVersion>
     <Product>Forge Neo 启动器</Product>
     <AssemblyTitle>Forge Neo 启动器</AssemblyTitle>
     <Description>Forge Neo 图形化启动器 —— 一键启动、实时日志、主题切换、版本管理、高级选项、PyTorch 环境、便携部署</Description>

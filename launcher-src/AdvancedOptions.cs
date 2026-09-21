@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -30,6 +31,34 @@ namespace ForgeNeoLauncher
         public bool PinSharedMemory;
         /// <summary>可扩展显存段（实验性）</summary>
         public bool ExpandableSegments;
+
+        /// <summary>
+        /// 预留显存给其他程序（<c>--reserve-vram</c>，单位 GB）。
+        ///
+        /// <para>存的是<b>界面上的原始文本</b>，空串 = 不启用。为什么不直接存 double：
+        /// 用户输到一半的「0.」「-」都得能原样留着，且"填了但不合法"必须能被
+        /// <see cref="ValidateFatal"/> 指出来 —— 存成 double 的话非法输入会被静默吞成 0，
+        /// 界面显示与实际行为就对不上了。</para>
+        ///
+        /// <para>⚠ 真的拼命令行时只认**能解析成正数**的值（见 <see cref="TryReserveVramArg"/>）——
+        /// 硬塞一个 <c>abc</c> 给 argparse 会让 Forge 直接崩在参数解析，报错离原因很远。</para>
+        /// </summary>
+        public string ReserveVram = "";
+
+        /// <summary>
+        /// 关掉对应的注意力后端（<c>--disable-sage</c> / <c>--disable-flash</c> /
+        /// <c>--disable-xformers</c>，定义在 <c>backend/args.py</c>）。
+        ///
+        /// <para>正常情况下这三个都该<b>关着</b>：Forge 会自己挑可用的后端。
+        /// 它们的价值在于<b>后端自动选择翻车时的逃生口</b> —— 例如 sageattention
+        /// 在 Windows 上编译/加载失败、或某次生成出现花屏与 NaN，
+        /// 逐个关掉就能定位是哪一个在捣乱，而不必去改代码。</para>
+        /// </summary>
+        public bool DisableSage;
+        /// <inheritdoc cref="DisableSage"/>
+        public bool DisableFlash;
+        /// <inheritdoc cref="DisableSage"/>
+        public bool DisableXformers;
 
         // ================= 服务与网络 =================
         /// <summary>
@@ -123,6 +152,15 @@ namespace ForgeNeoLauncher
         public List<string> LoraDirs = new List<string>();
         /// <summary>额外的 VAE 目录（--vae-dirs，可多条）</summary>
         public List<string> VaeDirs = new List<string>();
+        /// <summary>
+        /// 额外的文本编码器目录（<c>--text-encoder-dirs</c>，可多条）。
+        ///
+        /// <para>Flux / Qwen 这类「双文本编码器」模型把 text encoder 单独放一个目录，
+        /// 不声明的 WebUI 就只在自己的 <c>models/text_encoder</c> 里找 —— 放别处会「模型在，
+        /// 却报找不到文本编码器」。定义见本机 <c>modules/cmd_args.py</c>
+        /// （<c>action="append"</c>，故可多条）。</para>
+        /// </summary>
+        public List<string> TextEncoderDirs = new List<string>();
 
         /// <summary>把选项追加到启动参数里（不修改传入数组）</summary>
         public void AppendTo(List<string> args)
@@ -132,6 +170,14 @@ namespace ForgeNeoLauncher
             if (Autotune) args.Add("--autotune");
             if (PinSharedMemory) args.Add("--pin-shared-memory");
             if (ExpandableSegments) args.Add("--expandable-segments");
+
+            // 显存预留：只在填了合法正数时才发（理由见字段声明处）
+            if (TryReserveVramArg(out var gb)) { args.Add("--reserve-vram"); args.Add(gb); }
+
+            // 注意力后端逃生口。三个都是 store_true，互不排斥，勾几个发几个。
+            if (DisableSage) args.Add("--disable-sage");
+            if (DisableFlash) args.Add("--disable-flash");
+            if (DisableXformers) args.Add("--disable-xformers");
 
             // ---- 服务与网络 ----
             // 刻意不发 --autolaunch：子进程带着 SD_WEBUI_RESTARTING=1，它一定是空转，
@@ -156,6 +202,25 @@ namespace ForgeNeoLauncher
             foreach (var d in CkptDirs) { args.Add("--ckpt-dirs"); args.Add(d); }
             foreach (var d in LoraDirs) { args.Add("--lora-dirs"); args.Add(d); }
             foreach (var d in VaeDirs) { args.Add("--vae-dirs"); args.Add(d); }
+            foreach (var d in TextEncoderDirs) { args.Add("--text-encoder-dirs"); args.Add(d); }
+        }
+
+        /// <summary>
+        /// 把「预留显存」的输入文本转成能交给 argparse 的字符串。
+        /// 返回 false = <b>不发这个参数</b>（没填 / 解析不出来 / 不是正数）。
+        ///
+        /// <para>用 InvariantCulture 是为了不看机器区域设置：中文系统上如果按本地习惯解析，
+        /// <c>0.5</c> 有可能被当成日期或整数，拼出来的命令行会随机器而变。</para>
+        /// </summary>
+        public bool TryReserveVramArg(out string value)
+        {
+            value = "";
+            var t = (ReserveVram ?? "").Trim();
+            if (t.Length == 0) return false;
+            if (!double.TryParse(t, NumberStyles.Float, CultureInfo.InvariantCulture, out var gb)) return false;
+            if (double.IsNaN(gb) || double.IsInfinity(gb) || gb <= 0) return false;
+            value = gb.ToString("0.###", CultureInfo.InvariantCulture);
+            return true;
         }
 
         /// <summary>认证串：允许多组，用逗号分隔；单组时规范化为 u:p</summary>
@@ -212,11 +277,17 @@ namespace ForgeNeoLauncher
             }
 
             // 模型目录必须存在，否则 Forge 启动时才报错，排查起来很绕
-            foreach (var p in CkptDirs.Concat(LoraDirs).Concat(VaeDirs))
+            foreach (var p in CkptDirs.Concat(LoraDirs).Concat(VaeDirs).Concat(TextEncoderDirs))
             {
                 if (!Directory.Exists(p))
                     list.Add($"模型目录不存在：{p}");
             }
+
+            // 预留显存填了但不合法：这个参数会被静默丢掉（见 TryReserveVramArg），
+            // 「我明明填了却没生效」比直接报错更难查 —— 所以这里要明说
+            var rv = (ReserveVram ?? "").Trim();
+            if (rv.Length > 0 && !TryReserveVramArg(out _))
+                list.Add($"预留显存「{rv}」不是有效的正数（单位 GB，例如 0.5 或 1），该参数不会生效。请改正或留空。");
 
             return list.Distinct().ToList();
         }
@@ -231,6 +302,21 @@ namespace ForgeNeoLauncher
 
             if (ExpandableSegments)
                 list.Add("可扩展显存段为实验性选项，偶发不稳定，如遇生成异常可先关掉它。");
+
+            if (TryReserveVramArg(out var gb))
+                list.Add($"已预留 {gb} GB 显存给其他程序：Forge 能用的显存会相应减少，"
+                       + "跑大图、大模型或高分辨率放大时可能显存不足（OOM）。够用就留空。");
+
+            if (DisableSage || DisableFlash || DisableXformers)
+            {
+                var off = new List<string>();
+                if (DisableSage) off.Add("sageattention");
+                if (DisableFlash) off.Add("flash_attn");
+                if (DisableXformers) off.Add("xformers");
+                list.Add($"已关闭注意力后端：{string.Join("、", off)}。"
+                       + "这几个开关是「后端自动选择出问题」时的逃生口，正常情况下不该勾 —— "
+                       + "关掉后显存占用与速度通常都会变差。确认不再报错后建议关回去。");
+            }
 
             if (UseA1111Home && !string.IsNullOrWhiteSpace(A1111Home) && Directory.Exists(A1111Home.Trim()))
             {
@@ -261,6 +347,10 @@ namespace ForgeNeoLauncher
             LauncherConfig.SetBool("Adv.Autotune", Autotune);
             LauncherConfig.SetBool("Adv.PinSharedMemory", PinSharedMemory);
             LauncherConfig.SetBool("Adv.ExpandableSegments", ExpandableSegments);
+            LauncherConfig.Set("Adv.ReserveVram", ReserveVram ?? "");
+            LauncherConfig.SetBool("Adv.DisableSage", DisableSage);
+            LauncherConfig.SetBool("Adv.DisableFlash", DisableFlash);
+            LauncherConfig.SetBool("Adv.DisableXformers", DisableXformers);
 
             // ⚠ 换了键名（旧 Adv.AutoLaunch 不再读）：旧键在很多人的 cfg 里是 "0"，
             //   沿用会让他们升级后"突然不再自动开界面"；新键缺省即「开」，行为保持不变。
@@ -281,6 +371,7 @@ namespace ForgeNeoLauncher
             LauncherConfig.SetList("Adv.CkptDirs", CkptDirs);
             LauncherConfig.SetList("Adv.LoraDirs", LoraDirs);
             LauncherConfig.SetList("Adv.VaeDirs", VaeDirs);
+            LauncherConfig.SetList("Adv.TextEncoderDirs", TextEncoderDirs);
         }
 
         public static AdvancedOptions Load()
@@ -291,6 +382,10 @@ namespace ForgeNeoLauncher
                 Autotune = LauncherConfig.GetBool("Adv.Autotune"),
                 PinSharedMemory = LauncherConfig.GetBool("Adv.PinSharedMemory"),
                 ExpandableSegments = LauncherConfig.GetBool("Adv.ExpandableSegments"),
+                ReserveVram = LauncherConfig.Get("Adv.ReserveVram"),
+                DisableSage = LauncherConfig.GetBool("Adv.DisableSage"),
+                DisableFlash = LauncherConfig.GetBool("Adv.DisableFlash"),
+                DisableXformers = LauncherConfig.GetBool("Adv.DisableXformers"),
 
                 AutoOpenBrowser = LauncherConfig.GetBool("Adv.AutoOpenBrowser", true),
                 Api = LauncherConfig.GetBool("Adv.Api"),
@@ -305,18 +400,20 @@ namespace ForgeNeoLauncher
                 A1111Home = LauncherConfig.Get("Adv.A1111Home"),
                 CkptDirs = LauncherConfig.GetList("Adv.CkptDirs"),
                 LoraDirs = LauncherConfig.GetList("Adv.LoraDirs"),
-                VaeDirs = LauncherConfig.GetList("Adv.VaeDirs")
+                VaeDirs = LauncherConfig.GetList("Adv.VaeDirs"),
+                TextEncoderDirs = LauncherConfig.GetList("Adv.TextEncoderDirs")
             };
         }
 
         public void Reset()
         {
             NoHashing = false; Autotune = false; PinSharedMemory = false; ExpandableSegments = false;
+            ReserveVram = ""; DisableSage = false; DisableFlash = false; DisableXformers = false;
             AutoOpenBrowser = true; Api = false; Listen = false; GradioAuth = "";
             InstallExtDeps = false;
             MirrorSource = ForgeNeoLauncher.DownloadSource.Cn;
             UseA1111Home = false; A1111Home = "";
-            CkptDirs.Clear(); LoraDirs.Clear(); VaeDirs.Clear();
+            CkptDirs.Clear(); LoraDirs.Clear(); VaeDirs.Clear(); TextEncoderDirs.Clear();
         }
     }
 
