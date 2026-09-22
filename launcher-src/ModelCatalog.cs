@@ -110,6 +110,42 @@ namespace ForgeNeoLauncher
         /// </summary>
         public const int MaxEntriesShown = 50;
 
+        /// <summary>
+        /// 元数据 / 附属文件类扩展名 —— <b>只用于"判断一个文件该不该被隐藏"，绝不用于"判断谁是模型"</b>。
+        ///
+        /// <para>⚠ 这个方向不能反（v0.36）。v0.34 立的规矩是<b>不许按后缀白名单过滤</b>：
+        /// 白名单会<b>静默漏掉</b>新格式（`.gguf` 之类），用户看到"文件明明在、这里却没有"。
+        /// 所以这里做的是<b>黑名单</b> —— 只滤"一眼能认出是附属文件"的，<b>黑名单之外的一切照样显示</b>：
+        /// 哪天上游多出个 `.xyz` 模型格式，它不在黑名单里 ⇒ 照常列出来。
+        /// 一句话：<b>错误的方向只能是"多显示一个附属文件"，不能是"少显示一个模型"。</b></para>
+        ///
+        /// <para>⚠ 而且<b>进了这张表也还不算数</b>：还得过 <see cref="IsSidecar"/> 的规则②
+        /// ——"旁边必须真有个同名模型"。所以这张表宁可放宽（多列几个后缀，
+        /// 代价只是"多滤掉一个恰好同名的文件"），窄了才是问题。</para>
+        ///
+        /// <para><b>v0.36 补过一轮</b>：起因是拿真实 <c>models\</c> 目录审了一遍（§3.6.1 的教训
+        /// ——小目录永远测不出真磁盘上的形态），发现三类"旁边明明站着同名模型、却还在显示"的：
+        /// <c>novaExanimeAM_v10.metadata.json</c>（中间多了一层 <c>.metadata</c>）、
+        /// <c>Concept_waruochi_v2_merged.sha256</c>（校验和）、
+        /// <c>Concept_waruochi_v2_merged.jpeg</c>（Civitai 下载的预览图，
+        /// 老版本给的是 <c>.jpeg</c> 而不是 <c>.preview.png</c>）。
+        /// 所以补进 <c>.csv</c> / <c>.toml</c> / <c>.md</c> 与四个图片后缀；
+        /// 同时把规则②的匹配从"同名前缀"放宽到"逐段前缀"（看清那三条判据的注释）。</para>
+        /// </summary>
+        private static readonly string[] MetaExt =
+            { ".json", ".yaml", ".yml", ".txt", ".csv", ".toml", ".md",
+              ".png", ".jpg", ".jpeg", ".webp" };
+
+        /// <summary>
+        /// 模型常见的文件后缀 —— <b>仅用于 "<c>foo.json</c> 旁边是不是真有个叫 <c>foo</c> 的模型"</b>
+        /// 这一个判断（见 <see cref="IsSidecar"/> 的规则②）。
+        ///
+        /// <para>它<b>不是</b>白名单：模型自己从不被这个数组筛掉，它只影响"某个元数据文件要不要藏"。
+        /// 所以某个新格式不在表里，后果是<b>多显示一个 json</b>（看得见），而不是少显示一个模型。</para>
+        /// </summary>
+        private static readonly string[] ModelExt =
+            { ".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".sft", ".gguf", ".onnx", ".pkl", ".patch" };
+
         // ==================================================================
         //  数据模型
         // ==================================================================
@@ -149,7 +185,23 @@ namespace ForgeNeoLauncher
             public string NoteText { get; set; } = "";
             /// <summary>被截断时的说明；没截断为空串</summary>
             public string MoreText { get; set; } = "";
-            /// <summary>本层条目（文件在前、子目录在后；最多 <see cref="MaxEntriesShown"/> 条）</summary>
+            /// <summary>
+            /// 被隐藏的附属文件说明（v0.36）；没有隐藏时为空串。
+            ///
+            /// <para>⚠ 它<b>不</b>让 <see cref="CountText"/> / <see cref="SizeText"/> 跟着变小 ——
+            /// 那两个是<b>磁盘事实</b>（"这个目录里到底有什么"），隐藏是<b>显示层</b>的行为。
+            /// 两个数字同时在场、再加这一行说明，账才对得上：卡片头写「7 个文件」、
+            /// 下面列 3 行、小字说"已隐藏 4 个附属文件" —— 换句话说，<b>不许静默</b>。</para>
+            /// </summary>
+            public string HiddenText { get; set; } = "";
+            /// <summary>
+            /// 本层条目（文件在前、子目录在后）。
+            ///
+            /// <para>⚠ 语义随"在哪一层"而变：<c>ReadFolder</c> 产出的<b>数据层</b>是<b>全量</b>
+            /// （不裁剪、不过滤）；交给界面的那份是 <c>Filter</c> → <c>Visible</c> → <c>Clip</c>
+            /// 之后的结果（剔掉附属文件、最多 <see cref="MaxEntriesShown"/> 条）。
+            /// 别拿前者当后者用 —— 这正是 v0.34 搜索假否定与 v0.36 列表全是元数据的同一个根。</para>
+            /// </summary>
             public List<ModelEntry> Entries { get; set; } = new List<ModelEntry>();
         }
 
@@ -304,11 +356,14 @@ namespace ForgeNeoLauncher
                 if (nFile == 0 && nDir == 0)
                     m.NoteText = "目录是空的 —— 还没往这里放模型";
 
-                // ⚠ 这里**不裁剪**：Entries 保留全量，裁剪只发生在 Filter 产出的"显示版"里。
-                //   v0.34 初版是在这里就砍到前 50 项 —— 于是**搜索也只能在那 50 项里搜**：
-                //   磁盘上 814 个 LoRA，在搜索框里敲自己模型的名字却命中 0 张卡，
-                //   而模型其实好好地躺着。数据层给全量、显示层负责裁剪 ——
-                //   跟进度条那条"比例是模型、像素是投影"是同一条规矩。
+                // ⚠ 这里**既不过滤也不裁剪**：Entries 保留磁盘上的全量，
+                //   "剔掉附属文件"与"最多显示 50 条"两件事都发生在显示层
+                //   （Filter → Visible → Clip）。理由有两条，都踩过：
+                //   ① v0.34 在这里就砍到前 50 项 —— 于是**搜索也只能在那 50 项里搜**：
+                //      磁盘上 814 个 LoRA，敲自己模型的名字却命中 0 张卡，模型其实好好躺着；
+                //   ② v0.36 若在这里就剔掉 .civitai.info 之类，CountText / SizeText 也会
+                //      跟着变小 —— 那两个数该是**磁盘事实**，隐藏是显示层的事，两笔账分开记。
+                //   「数据层给全量、显示层负责裁剪」与进度条那条「比例是模型、像素是投影」同源。
             }
             catch (Exception ex)
             {
@@ -352,6 +407,14 @@ namespace ForgeNeoLauncher
         /// <para><b>匹配一律基于全量条目，裁剪只在这里做</b>：若在数据层就把卡片砍到前 50 项，
         /// 搜索也只剩那 50 项可搜 —— 用户敲自己模型的名字会得到 0 张卡，
         /// 而模型其实好好躺在磁盘上。这正是这一页最该避免的假否定。</para>
+        ///
+        /// <para>⚠ <b>先剔附属文件、再匹配关键词</b>（v0.36）：这一页要回答的是"我的模型在不在"，
+        /// 而 <c>.civitai.info</c> / <c>.preview.png</c> 这类伴生文件在磁盘上永远和模型同名 ——
+        /// 搜「nova」时若不过滤，三行里有四行是元数据。所以过滤是<b>整页统一的显示规则</b>，
+        /// 带不带关键词都生效。</para>
+        /// <para>⚠ 这么做<b>不会</b>造成"搜不到模型"：被隐藏的只有附属文件，
+        /// <b>模型文件自己从不被过滤</b>（见 <see cref="MetaExt"/> 那段注释）。
+        /// v0.35 那条"搜不到比没列出来更危险"照样守得住。</para>
         /// </summary>
         public static List<ModelFolder> Filter(List<ModelFolder> all, string keyword)
         {
@@ -362,27 +425,150 @@ namespace ForgeNeoLauncher
 
             foreach (var m in all)
             {
+                // 显示层过滤：全量仍留在 m.Entries 里（CountText / SizeText 照旧是磁盘事实），
+                // 这里只是产出"该画出来的那一份"，并顺带算好隐藏说明。
+                var vis = Visible(m, out string hiddenText);
+
                 if (k.Length == 0)
                 {
-                    result.Add(Clip(m, m.Entries, false));
+                    result.Add(Clip(m, vis, false, hiddenText));
                     continue;
                 }
 
                 if (Hit(m.Title, k) || Hit(m.Desc, k) || Hit(m.Dir, k))
                 {
-                    result.Add(Clip(m, m.Entries, false));
+                    result.Add(Clip(m, vis, false, hiddenText));
                     continue;
                 }
 
-                var hits = m.Entries.Where(e => Hit(e.Name, k)).ToList();
+                var hits = vis.Where(e => Hit(e.Name, k)).ToList();
                 if (hits.Count == 0) continue;
 
-                result.Add(Clip(m, hits, true));
+                result.Add(Clip(m, hits, true, hiddenText));
             }
             return result;
 
             static bool Hit(string s, string k) =>
                 !string.IsNullOrEmpty(s) && s.IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        /// <summary>
+        /// 把一张卡的全量条目过成"该画出来的那一份"，并给出被隐藏的说明。
+        ///
+        /// <para><b>纯函数</b>：<paramref name="m"/> 一个字段都不改，返回的是新列表。</para>
+        /// </summary>
+        private static List<ModelEntry> Visible(ModelFolder m, out string hiddenText)
+        {
+            hiddenText = "";
+
+            // 先收一份"这个目录里有哪些文件"的名字表 —— 规则②要拿它问"旁边有同名模型吗"
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var e in m.Entries)
+                if (!e.IsDir) names.Add(e.Name);
+
+            var vis = new List<ModelEntry>();
+            var kinds = new List<string>();
+            int hidden = 0;
+
+            foreach (var e in m.Entries)
+            {
+                if (!e.IsDir && IsSidecar(e.Name, names, out string kind))
+                {
+                    hidden++;
+                    if (!kinds.Contains(kind)) kinds.Add(kind);   // 同类只报一次，别把说明撑成一行字
+                    continue;
+                }
+                vis.Add(e);
+            }
+
+            if (hidden > 0)
+                hiddenText = $"已隐藏 {hidden} 个附属文件（{string.Join(" / ", kinds)}）—— 它们不是模型，仍在磁盘上";
+
+            return vis;
+        }
+
+        /// <summary>
+        /// 这个文件是不是"模型的附属文件"（该从列表里去掉）？
+        ///
+        /// <para><b>规则①：名字里带明确标记</b> —— 这类<b>绝不可能是模型</b>，可以放心滤。
+        /// <c>foo.safetensors.civitai.info</c>、<c>foo.preview.png</c>、
+        /// <c>desktop.ini</c> / <c>Thumbs.db</c>、<c>foo.safetensors.sha256</c>，
+        /// 以及上游自带的那批占位说明（<c>Put LoRA here.txt</c>）。</para>
+        ///
+        /// <para><b>规则②：元数据扩展名 + 旁边真有同名模型</b> —— 裸的 <c>foo.json</c> 单独看
+        /// 分不清它是 Civitai 伴生还是某份模型的<b>必需组件</b>（<c>diffusers</c> 的
+        /// <c>model_index.json</c>、ONNX 模型的 <c>config.json</c> 就是后者，滤掉会让用户
+        /// 以为缺文件）。所以只有"旁边站着 <c>foo.safetensors</c> 之类"时才判为附属；
+        /// <b>拿不准则保留</b> —— 与 <c>PortGuard</c> 那条 fail-safe 同源：
+        /// 假阴性（多显示一个 json）无害，假阳性（藏掉一个必需文件）会让人白折腾。</para>
+        ///
+        /// <para>规则②的"旁边站着谁"有<b>三种形态</b>，缺一种就会漏（v0.36 实盘踩到第三种）：
+        /// <list type="number">
+        /// <item><c>foo.json</c> ← <c>foo.safetensors</c>：把文件名当模型名</item>
+        /// <item><c>foo.safetensors.json</c> ← <c>foo.safetensors</c>：stem 自己就是模型文件</item>
+        /// <item><c>foo.metadata.json</c> / <c>foo.safetensors.metadata.json</c>
+        ///       ← <c>foo.safetensors</c>：stem 里<b>多了一段</b>，
+        ///       这时要按 <c>.</c> 逐段取前缀再问 —— 光比"整段前缀"会把这一类全漏掉
+        ///       （真实目录里 <c>novaExanimeAM_v10.metadata.json</c> 就是这么漏的）。</item>
+        /// </list></para>
+        /// </summary>
+        private static bool IsSidecar(string fileName, HashSet<string> names, out string kind)
+        {
+            kind = "";
+
+            // ---- 规则①：明确标记 ----
+            if (fileName.EndsWith(".civitai.info", StringComparison.OrdinalIgnoreCase))
+            { kind = "Civitai 元数据"; return true; }
+
+            if (fileName.IndexOf(".preview.", StringComparison.OrdinalIgnoreCase) >= 0)
+            { kind = "预览图"; return true; }
+
+            if (fileName.Equals("desktop.ini", StringComparison.OrdinalIgnoreCase) ||
+                fileName.Equals("Thumbs.db", StringComparison.OrdinalIgnoreCase))
+            { kind = "系统文件"; return true; }
+
+            // 校验和文件 —— 语义太明确：它绝无可能是模型、也不可能是模型的必需组件
+            // （跟 .json 那种要防 diffusers 必需件的情况不同），所以不用等规则②。
+            if (fileName.EndsWith(".sha256", StringComparison.OrdinalIgnoreCase))
+            { kind = "校验和"; return true; }
+
+            // 上游 Forge 自带的占位说明：Put LoRA here.txt / Place Textual Inversion embeddings here.txt
+            // 这批名字是**上游硬编码**的模板文件，不是用户资料，所以按"明确标记"处理。
+            // 判据刻意收紧到"Put/Place 开头 + ' here.txt' 结尾"，免得误伤用户自己写的 x here.txt。
+            if (fileName.EndsWith(" here.txt", StringComparison.OrdinalIgnoreCase) &&
+                (fileName.StartsWith("Put ", StringComparison.OrdinalIgnoreCase) ||
+                 fileName.StartsWith("Place ", StringComparison.OrdinalIgnoreCase)))
+            { kind = "占位说明"; return true; }
+
+            // ---- 规则②：元数据扩展名 + 旁边真有同名模型 ----
+            string ext = Path.GetExtension(fileName);
+            if (!MetaExt.Contains(ext, StringComparer.OrdinalIgnoreCase)) return false;
+
+            string stem = fileName.Substring(0, fileName.Length - ext.Length);
+
+            // (2) foo.safetensors.json —— stem 自己就是旁边那个模型文件
+            if (names.Contains(stem)) { kind = "同名附属文件"; return true; }
+
+            // (1)(3) 把 stem 在 '.' 处逐段取前缀，逐段去问"这个前缀 + 某个模型后缀"在不在
+            //   foo.json                 → 前缀 foo                  → foo.safetensors ✓
+            //   foo.metadata.json        → 前缀 foo                  → ✓（第一段就命中）
+            //   foo.safetensors.metadata.json → 前缀 foo → foo.safetensors ✓
+            //   这样"中间多一段"的形态不用单独写规则 —— 逐段扫描天然覆盖。
+            int p = 0;
+            while (true)
+            {
+                int dot = stem.IndexOf('.', p);
+                string prefix = dot < 0 ? stem : stem.Substring(0, dot);
+                if (prefix.Length > 0)
+                {
+                    foreach (var me in ModelExt)
+                        if (names.Contains(prefix + me)) { kind = "同名附属文件"; return true; }
+                }
+                if (dot < 0) break;
+                p = dot + 1;
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -392,9 +578,10 @@ namespace ForgeNeoLauncher
         /// <para><b>只改副本</b>：<see cref="Clone"/> 已经浅拷贝过 <c>Entries</c>，
         /// 这里的取子集都生成新列表，原件一行不动（<c>_modeltest</c> 有断言盯着）。</para>
         /// </summary>
-        private static ModelFolder Clip(ModelFolder m, List<ModelEntry> rows, bool hitMode)
+        private static ModelFolder Clip(ModelFolder m, List<ModelEntry> rows, bool hitMode, string hiddenText)
         {
             var copy = Clone(m);
+            copy.HiddenText = hiddenText;
 
             if (rows.Count > MaxEntriesShown)
             {
@@ -426,6 +613,7 @@ namespace ForgeNeoLauncher
             SizeText = m.SizeText,
             NoteText = m.NoteText,
             MoreText = m.MoreText,
+            HiddenText = m.HiddenText,
             Entries = new List<ModelEntry>(m.Entries)
         };
 

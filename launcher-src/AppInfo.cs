@@ -13,10 +13,10 @@ namespace ForgeNeoLauncher
         /// 0.1 → 0.9 → 0.10 → 0.19 → 0.100（十进制进位，不是语义化的 major.minor.patch）。
         /// 故用两段式写法，以便自然支持 0.10、0.100 这类编号。
         /// </summary>
-        public const string Version = "0.35";
+        public const string Version = "0.36";
 
         /// <summary>版本代号 / 里程碑说明</summary>
-        public const string Codename = "一览无余";
+        public const string Codename = "去芜存菁";
 
         /// <summary>带 v 前缀的简短版本（如 v0.9）</summary>
         public static string Short => "v" + Version;

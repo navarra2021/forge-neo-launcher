@@ -560,16 +560,24 @@ namespace ForgeNeoLauncher
         ///
         /// <para>回收站不可用（网络盘 / 超长路径 / 组策略禁用）时返回失败，
         /// <b>不降级为永久删除</b>：把选择权还给用户，好过替他决定"那就算了直接删掉"。</para>
+        ///
+        /// <para>⚠ "失败"的判据是<b>目录还在不在</b>，不是接口的返回值（v0.36 修正）——
+        /// 详见 <see cref="RecycleBin"/>。所以这里只在"目录真的没动"时才说失败；
+        /// 目录没了就别说"目录未改动"，那是在撒谎。</para>
         /// </summary>
         public static (bool ok, string msg) Uninstall(ExtensionInfo item, string extDir)
         {
             var (can, reason) = CanUninstall(item, extDir);
             if (!can) return (false, "不能卸载：" + reason);
 
-            if (!RecycleBin.TryDelete(item.Path, out string err))
+            if (!RecycleBin.TryDelete(item.Path, out string err, out bool inBin))
                 return (false, "删除失败（目录未改动）：" + err + "。可以到资源管理器里手动删除。");
 
-            return (true, "已移入回收站");
+            // 目录确实没了。但"进没进回收站"是问过回收站才敢说的 ——
+            // 没问着（回收站查询不可用）时把话说含糊，别替回收站打包票。
+            return inBin
+                ? (true, "已移入回收站")
+                : (true, "已从磁盘移除，但没能向回收站确认它进去了（回收站可能被禁用）—— 需要的话请尽快到回收站里找一下");
         }
 
         // ==================================================================
