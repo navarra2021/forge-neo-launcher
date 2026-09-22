@@ -304,13 +304,11 @@ namespace ForgeNeoLauncher
                 if (nFile == 0 && nDir == 0)
                     m.NoteText = "目录是空的 —— 还没往这里放模型";
 
-                // 截断：文件在前、目录在后，所以先被砍掉的总是子目录（更次要的那批）
-                if (m.Entries.Count > MaxEntriesShown)
-                {
-                    int real = m.Entries.Count;
-                    m.Entries = m.Entries.Take(MaxEntriesShown).ToList();
-                    m.MoreText = $"仅显示前 {MaxEntriesShown} 项（此目录共 {real} 项）";
-                }
+                // ⚠ 这里**不裁剪**：Entries 保留全量，裁剪只发生在 Filter 产出的"显示版"里。
+                //   v0.34 初版是在这里就砍到前 50 项 —— 于是**搜索也只能在那 50 项里搜**：
+                //   磁盘上 814 个 LoRA，在搜索框里敲自己模型的名字却命中 0 张卡，
+                //   而模型其实好好地躺着。数据层给全量、显示层负责裁剪 ——
+                //   跟进度条那条"比例是模型、像素是投影"是同一条规矩。
             }
             catch (Exception ex)
             {
@@ -345,45 +343,76 @@ namespace ForgeNeoLauncher
         }
 
         /// <summary>
-        /// 按关键字过滤（**纯函数**，不改动传进来的列表）。
+        /// 按关键字过滤，并产出**可直接绑定到界面的那一份**（**纯函数**，不改动传进来的列表）。
         ///
         /// <para>两种命中方式，粒度不同：分类自己命中（名称 / 用途 / 路径）→ 整张卡片留着；
         /// 只有文件名命中 → 只保留命中的那几个文件。这样"某个 lora 在不在"
         /// 搜出来的就是那一行，而不是一张列着几十个文件的卡片。</para>
+        ///
+        /// <para><b>匹配一律基于全量条目，裁剪只在这里做</b>：若在数据层就把卡片砍到前 50 项，
+        /// 搜索也只剩那 50 项可搜 —— 用户敲自己模型的名字会得到 0 张卡，
+        /// 而模型其实好好躺在磁盘上。这正是这一页最该避免的假否定。</para>
         /// </summary>
         public static List<ModelFolder> Filter(List<ModelFolder> all, string keyword)
         {
             var result = new List<ModelFolder>();
             if (all == null) return result;
 
-            if (string.IsNullOrWhiteSpace(keyword))
-            {
-                result.AddRange(all);
-                return result;
-            }
+            string k = (keyword ?? "").Trim();
 
-            string k = keyword.Trim();
             foreach (var m in all)
             {
+                if (k.Length == 0)
+                {
+                    result.Add(Clip(m, m.Entries, false));
+                    continue;
+                }
+
                 if (Hit(m.Title, k) || Hit(m.Desc, k) || Hit(m.Dir, k))
                 {
-                    result.Add(m);
+                    result.Add(Clip(m, m.Entries, false));
                     continue;
                 }
 
                 var hits = m.Entries.Where(e => Hit(e.Name, k)).ToList();
                 if (hits.Count == 0) continue;
 
-                var copy = Clone(m);
-                copy.Entries = hits;
-                // 过滤后的条数是"命中数"，不是"显示的前 50 项"，原来那句截断说明必须撤掉
-                copy.MoreText = "";
-                result.Add(copy);
+                result.Add(Clip(m, hits, true));
             }
             return result;
 
             static bool Hit(string s, string k) =>
                 !string.IsNullOrEmpty(s) && s.IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        /// <summary>
+        /// 把一张卡裁成"界面要显示的那一份"（最多 <see cref="MaxEntriesShown"/> 条）。
+        /// 文件在前、目录在后，所以先被砍掉的总是子目录 —— 更次要的那批。
+        ///
+        /// <para><b>只改副本</b>：<see cref="Clone"/> 已经浅拷贝过 <c>Entries</c>，
+        /// 这里的取子集都生成新列表，原件一行不动（<c>_modeltest</c> 有断言盯着）。</para>
+        /// </summary>
+        private static ModelFolder Clip(ModelFolder m, List<ModelEntry> rows, bool hitMode)
+        {
+            var copy = Clone(m);
+
+            if (rows.Count > MaxEntriesShown)
+            {
+                copy.Entries = rows.Take(MaxEntriesShown).ToList();
+                copy.MoreText = hitMode
+                    ? $"仅显示前 {MaxEntriesShown} 项（共 {rows.Count} 项命中）"
+                    : $"仅显示前 {MaxEntriesShown} 项（此目录共 {rows.Count} 项）";
+            }
+            else
+            {
+                copy.Entries = new List<ModelEntry>(rows);
+            }
+
+            // 命中模式下条数已经不是"这个目录总共多少"，计数跟卡片对不上会看着像丢了东西
+            if (hitMode)
+                copy.CountText = $"{rows.Count} 项命中（此目录共 {m.Entries.Count} 项）";
+
+            return copy;
         }
 
         /// <summary>浅拷贝一张卡片（过滤时要换掉 <see cref="ModelFolder.Entries"/>，不能改原件）</summary>
