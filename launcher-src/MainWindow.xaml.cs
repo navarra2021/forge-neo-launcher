@@ -214,6 +214,12 @@ namespace ForgeNeoLauncher
         private bool coreCheckedOnce = false;
         // 插件管理：是否已扫过一次本地目录（决定进页面时要不要自动扫一遍）
         private bool extScannedOnce = false;
+        // 模型管理：上一次扫到的目录全集。搜索只改**显示**，不动这一份
+        private List<ModelCatalog.ModelFolder> modelFolders = new List<ModelCatalog.ModelFolder>();
+        // 模型管理：搜索关键字（空 = 全显示）
+        private string modelFilter = "";
+        // 模型管理：是否已扫过一次（决定进页面时要不要自动扫一遍）
+        private bool modelScannedOnce = false;
 
         // PyTorch 环境：是否已探测过（本地命令，不发网络）
         private bool torchProbedOnce = false;
@@ -940,7 +946,7 @@ namespace ForgeNeoLauncher
                 SetMenuActive(btn);
                 string tag = (btn.Tag as string) ?? "";
 
-                // 各页 → 各自的视图；「控制台」「疑难解答」「模型管理」→ 日志视图
+                // 各页 → 各自的视图；「控制台」「疑难解答」→ 日志视图
                 if (tag == "版本管理")
                 {
                     ShowVersionView();
@@ -948,6 +954,10 @@ namespace ForgeNeoLauncher
                 else if (tag == "插件管理")
                 {
                     ShowExtView();
+                }
+                else if (tag == "模型管理")
+                {
+                    ShowModelView();
                 }
                 else if (tag == "高级选项")
                 {
@@ -987,8 +997,9 @@ namespace ForgeNeoLauncher
                     case "插件管理": AddLog("已打开【插件管理】。可以在这里安装 / 启用禁用 / 卸载 / 更新插件。", InfoBrush); break;
                     case "模型管理":
                         AddLog(advOpts.UseA1111Home && !string.IsNullOrWhiteSpace(advOpts.A1111Home)
-                            ? $"模型目录：复用已有 A1111 安装 {advOpts.A1111Home}"
-                            : $"模型目录：{AppPaths.ModelsDir}（可在【高级选项 → 模型目录】里追加其他目录）", InfoBrush);
+                            ? $"已打开【模型管理】。这一页只读：列出每个模型目录里有什么、多大；模型目录当前复用已有 A1111 安装 {advOpts.A1111Home}。"
+                            : $"已打开【模型管理】。这一页只读：列出每个模型目录里有什么、多大；要追加其他位置的目录请去【高级选项 → 模型目录】。",
+                            InfoBrush);
                         break;
                 }
             }
@@ -1008,6 +1019,7 @@ namespace ForgeNeoLauncher
             DeployView.Visibility    = view == ViewDeploy    ? Visibility.Visible : Visibility.Collapsed;
             VersionView.Visibility   = view == ViewVersion   ? Visibility.Visible : Visibility.Collapsed;
             ExtensionView.Visibility = view == ViewExt       ? Visibility.Visible : Visibility.Collapsed;
+            ModelView.Visibility     = view == ViewModel     ? Visibility.Visible : Visibility.Collapsed;
             AdvancedView.Visibility  = view == ViewAdvanced  ? Visibility.Visible : Visibility.Collapsed;
 
             // 顶栏**整条**在首页收起，把顶部那 64px 全让给题图
@@ -1053,6 +1065,12 @@ namespace ForgeNeoLauncher
                 // 要问"有没有新版本"是「检测插件更新」那个按钮的事。
                 _ = RescanExtensionsAsync();
             }
+            else if (view == ViewModel && !modelScannedOnce)
+            {
+                // 模型页同理：进来先扫一遍本地目录（只枚举一层，不发网络）——
+                // 用户进这一页就是想看"我放的模型到底在不在"。
+                _ = RescanModelsAsync();
+            }
         }
 
         private const string ViewHome      = "home";
@@ -1061,9 +1079,13 @@ namespace ForgeNeoLauncher
         private const string ViewVersion   = "version";
         private const string ViewExt       = "ext";
         private const string ViewAdvanced  = "advanced";
+        // ⚠ 与控件名 ModelView 的字母顺序**不同**（照 ViewExt / ExtensionView 的旧例），
+        //   读代码时别看错：ViewModel 是"模型这一页"的视图标识。
+        private const string ViewModel     = "models";
 
         private void ShowVersionView()  => ShowView(ViewVersion);
         private void ShowExtView()      => ShowView(ViewExt);
+        private void ShowModelView()    => ShowView(ViewModel);
         private void ShowAdvancedView() => ShowView(ViewAdvanced);
         private void ShowMainView()     => ShowView(ViewMain);
 
@@ -2498,6 +2520,103 @@ namespace ForgeNeoLauncher
                 });
             }
         }
+
+        // ================= 模型管理页 =================
+
+        /// <summary>
+        /// 重扫模型目录。**纯本地只读**，不发网络请求。
+        ///
+        /// <para><b>两件事必须在 UI 线程先做完</b>：① 追加目录要经 <see cref="GetDirList"/> 取，
+        /// 而它内部有一处 <c>AddLog</c> —— 从线程池调用就是跨线程碰控件；
+        /// ② 取回来的是模型里那个 <c>List</c> 的引用，先拷一份再交给线程池，
+        /// 否则扫描期间用户点一下「保存并应用」就是在枚举中改列表。</para>
+        ///
+        /// <para>扫描本身只枚举一层，但追加目录可能配在网络盘上 —— 那种目录一次
+        /// <c>GetFiles</c> 也可能要几百毫秒，所以整体还是放线程池。</para>
+        /// </summary>
+        private async Task RescanModelsAsync()
+        {
+            string modelsDir = AppPaths.ModelsDir;
+
+            // ① 在 UI 线程把追加目录取好（GetDirList 里有 AddLog，不能在线程池里调）
+            var extras = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var k in ModelCatalog.Known)
+            {
+                if (string.IsNullOrEmpty(k.Tag)) continue;
+                extras[k.Tag] = new List<string>(GetDirList(k.Tag));   // ② 拷一份
+            }
+
+            var list = await Task.Run(() => ModelCatalog.Scan(
+                modelsDir,
+                tag => extras.TryGetValue(tag, out var v) ? v : new List<string>()));
+
+            Dispatcher.Invoke(() =>
+            {
+                modelFolders = list;
+                modelScannedOnce = true;
+                ApplyModelFilter();
+            });
+        }
+
+        /// <summary>
+        /// 按关键字过滤，并把**计数**写进本页状态栏（计数文案只在这里拼，别处别自己拼）。
+        ///
+        /// <para>⚠ 每次都<b>重挂 <c>ItemsSource</c></b>：模型对象是普通 POCO、没实现
+        /// <c>INotifyPropertyChanged</c>，换掉列表内容而不重挂的话界面不会变（**且不报错**）。</para>
+        /// </summary>
+        private void ApplyModelFilter(string prefix = "")
+        {
+            var shown = ModelCatalog.Filter(modelFolders, modelFilter);
+            ModelList.ItemsSource = shown;
+
+            string count = modelFolders.Count == 0
+                ? "没有可显示的目录"
+                : (string.IsNullOrWhiteSpace(modelFilter)
+                    ? $"共 {modelFolders.Count} 个目录"
+                    : $"匹配 {shown.Count} / {modelFolders.Count} 个目录");
+
+            ModelStatusText.Text = string.IsNullOrEmpty(prefix) ? count : prefix + " · " + count;
+        }
+
+        /// <summary>搜索框：输入即筛（只改显示，不动 modelFolders 全集）</summary>
+        private void ModelSearch_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            modelFilter = ModelSearchBox.Text ?? "";
+            ApplyModelFilter();
+        }
+
+        /// <summary>重新扫描模型目录（纯本地只读；不发任何网络请求）</summary>
+        private async void ModelRefresh_Click(object sender, RoutedEventArgs e)
+        {
+            BtnModelRefresh.IsEnabled = false;
+            ModelStatusText.Text = "正在扫描 ...";
+            try
+            {
+                await RescanModelsAsync();
+
+                int missing = modelFolders.Count(f => !f.Exists);
+                ApplyModelFilter($"扫描完成（{DateTime.Now:HH:mm:ss}）"
+                                 + (missing > 0 ? $"，其中 {missing} 个目录不存在" : ""));
+                AddLog($"模型目录扫描完成：{modelFolders.Count} 个。", InfoBrush);
+            }
+            catch (Exception ex)
+            {
+                ModelStatusText.Text = "扫描失败：" + ex.Message;
+                AddLog("模型目录扫描失败：" + ex.Message, ErrorBrush);
+            }
+            finally { BtnModelRefresh.IsEnabled = true; }
+        }
+
+        /// <summary>打开某一张卡片对应的目录（Tag 里存的是**路径字符串**，不是卡片对象）</summary>
+        private void ModelOpen_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not Button btn) return;
+            if (btn.Tag is string path && !string.IsNullOrWhiteSpace(path)) OpenFolder(path);
+        }
+
+        /// <summary>打开 models 根目录</summary>
+        private void ModelOpenRoot_Click(object sender, RoutedEventArgs e)
+            => OpenFolder(AppPaths.ModelsDir);
 
         // ================= 端口与进程归属 =================
         // 端口探测统一走 PortGuard（纯函数、可单独跑测试）。
