@@ -2,14 +2,14 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>ForgeNeoLauncher</AssemblyName>
     <RootNamespace>ForgeNeoLauncher</RootNamespace>
     <!-- 单文件发布 + 自包含（连 .NET 运行时一起打进 exe），
-         对方机器不用装 .NET 8 桌面运行时也能双击就跑 -->
+         对方机器不用装 .NET 10 桌面运行时也能双击就跑 -->
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
@@ -23,10 +23,10 @@
     <ApplicationIcon>icon\face_adaptive.ico</ApplicationIcon>
     <!-- 版本信息（会写入 exe 文件属性）-->
     <!-- 0.x 阶段采用线性递进编号：0.1 → 0.9 → 0.10 → 0.100，此处两段式写法 -->
-    <Version>0.36</Version>
-    <AssemblyVersion>0.36.0.0</AssemblyVersion>
-    <FileVersion>0.36.0.0</FileVersion>
-    <InformationalVersion>0.36</InformationalVersion>
+    <Version>0.37</Version>
+    <AssemblyVersion>0.37.0.0</AssemblyVersion>
+    <FileVersion>0.37.0.0</FileVersion>
+    <InformationalVersion>0.37</InformationalVersion>
     <Product>Forge Neo 启动器</Product>
     <AssemblyTitle>Forge Neo 启动器</AssemblyTitle>
     <Description>Forge Neo 图形化启动器 —— 一键启动、实时日志、主题切换、版本管理、插件管理、模型管理、高级选项、PyTorch 环境、便携部署</Description>

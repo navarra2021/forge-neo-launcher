@@ -59,13 +59,13 @@
 
 ## 自己构建
 
-需要 [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)。
+需要 [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-产物为 `_published\ForgeNeoLauncher.exe` —— 自包含单文件，约 73 MB。
+产物为 `_published\ForgeNeoLauncher.exe` —— 自包含单文件，约 63 MB。
 
 ## 目录结构
 
