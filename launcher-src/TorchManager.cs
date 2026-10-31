@@ -114,10 +114,14 @@ namespace ForgeNeoLauncher
     /// 而且必须先知道「torch 2.13 配 torchvision 0.28」这种对应关系才能给出可安装的组合。
     /// 这份清单是逐个访问 download.pytorch.org 的索引实测出来的，不是凭记忆写的。
     ///
-    /// 🔑 两条实测得出的规律（照抄官方发布节奏）：
-    ///   1. torchvision 版本 = 0.(torch 次版本号 + 15)，如 torch 2.13 → torchvision 0.28
+    /// 🔑 三条实测规律（前两条来自 2.14 及以前，第三条是 2.15 带来的新事实）：
+    ///   1. ⚠ 「torchvision = 0.(torch 次版本号 + 15)」**在 2.15 上失效**：
+    ///      2.15 配的是 torchvision **0.29.2**，不是 0.30 —— 0.30 从未发布。
+    ///      （2.15 起 tv 只出补丁版。**别再照着这条推算**，一律以索引实测为准。）
     ///   2. torchaudio 在 2.12 之后已停止发布 —— 故 2.12+ 的组合只装 torch + torchvision。
     ///      硬装 torchaudio==2.13.0 会直接 404。
+    ///   3. **2.15 起 cu126 / cu130 停止构建**（2026-10-31 实测：cu130 索引里 2.15 条目为 0）
+    ///      ⇒ cu130 的天花板是 **2.14.1**，要装 2.15 只能走 **cu132 / cu134**。
     /// </summary>
     public static class TorchManager
     {
@@ -134,14 +138,30 @@ namespace ForgeNeoLauncher
                 new TorchBranch
                 {
                     Id = "cu130", CudaVersion = "13.0", Title = "CUDA 13.0 (cu130)",
-                    Description = "CUDA 13.0 — 当前稳定 CUDA 支线，适用于 RTX 20 系列及更新显卡",
+                    Description = "CUDA 13.0 — 2.15 起停止构建，天花板 2.14.1；适用于 RTX 20 系列及更新显卡",
                     Builds = new List<TorchBuild>
                     {
-                        new TorchBuild { Torch = "2.14.0", TorchVision = "0.29.0", Note = "该支线最新" },
+                        new TorchBuild { Torch = "2.14.1", TorchVision = "0.29.1", Note = "该支线最新（2.15 起停更）" },
+                        new TorchBuild { Torch = "2.14.0", TorchVision = "0.29.0" },
                         new TorchBuild { Torch = "2.13.0", TorchVision = "0.28.0" },
                         new TorchBuild { Torch = "2.12.1", TorchVision = "0.27.1", Note = "官方自此版本起不再发布 torchaudio" },
                         new TorchBuild { Torch = "2.11.0", TorchVision = "0.26.0", TorchAudio = "2.11.0", Note = "最后一个含 torchaudio 的组合" },
                         new TorchBuild { Torch = "2.10.0", TorchVision = "0.25.0", TorchAudio = "2.10.0" },
+                    }
+                },
+                // ⚠ 顺序有意为之：cu132 虽然是更新的 CUDA，但**不放在首位** ——
+                //   MainWindow 刷新下拉框时用 branches[0] 兜「首次打开」的默认选中项
+                //   （见 RefreshTorchBranches 的 `?? branches[0]`），放首位就等于
+                //   把全新部署的默认版本悄悄切到 2.15。那是另一个决定，本次没做。
+                new TorchBranch
+                {
+                    Id = "cu132", CudaVersion = "13.2", Title = "CUDA 13.2 (cu132)",
+                    Description = "CUDA 13.2 — 2.15 起的默认支线（需 NVIDIA 驱动 580+）；适用于 RTX 20 系列及更新显卡",
+                    Builds = new List<TorchBuild>
+                    {
+                        new TorchBuild { Torch = "2.15.0", TorchVision = "0.29.2", Note = "该支线最新" },
+                        new TorchBuild { Torch = "2.14.1", TorchVision = "0.29.1" },
+                        new TorchBuild { Torch = "2.14.0", TorchVision = "0.29.0" },
                     }
                 },
                 new TorchBranch
